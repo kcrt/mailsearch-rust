@@ -85,16 +85,14 @@ fn extract_body_text(mail: &mailparse::ParsedMail<'_>, text_parts: &mut Vec<Stri
     }
 
     if content_type.starts_with("text/plain") {
-        if let Ok(body) = mail.get_body_raw() {
-            if let Ok(text) = std::str::from_utf8(&body) {
-                text_parts.push(text.to_string());
-            }
+        // Use get_body() which handles character encoding automatically
+        if let Ok(text) = mail.get_body() {
+            text_parts.push(text);
         }
     } else if content_type.starts_with("text/html") {
-        if let Ok(body) = mail.get_body_raw() {
-            if let Ok(text) = std::str::from_utf8(&body) {
-                text_parts.push(strip_html_tags(text));
-            }
+        // Use get_body() which handles character encoding automatically
+        if let Ok(text) = mail.get_body() {
+            text_parts.push(strip_html_tags(&text));
         }
     } else if content_type.starts_with("multipart/") {
         for subpart in &mail.subparts {
