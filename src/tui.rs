@@ -128,9 +128,8 @@ fn draw_ui(f: &mut Frame, app: &App) {
     let content = if let Some(result) = app.selected_result() {
         // Format metadata header
         let metadata = format!(
-            "From: {}\nDate: {}\nSubject: {}\n\n---\n\n{}",
+            "From: {}\nSubject: {}\n---\n{}",
             result.from_addr,
-            result.date_str,
             result.subject,
             result.content
         );
