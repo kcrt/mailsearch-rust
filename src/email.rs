@@ -105,10 +105,20 @@ fn extract_body_text(mail: &mailparse::ParsedMail<'_>, text_parts: &mut Vec<Stri
 
 /// Check if text matches the search query (all terms must be present).
 pub fn matches_query(text: &str, query: &str) -> bool {
-    let text_lower = text.to_ascii_lowercase();
-    query
+    // Pre-process query terms to lowercase once
+    let lowercase_terms: Vec<String> = query
         .split_whitespace()
-        .all(|term| text_lower.contains(&term.to_ascii_lowercase()))
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+    
+    matches_query_with_terms(text, &lowercase_terms)
+}
+
+/// Check if text matches pre-processed lowercase search terms.
+/// This is more efficient when matching multiple documents with the same query.
+pub fn matches_query_with_terms(text: &str, lowercase_terms: &[String]) -> bool {
+    let text_lower = text.to_ascii_lowercase();
+    lowercase_terms.iter().all(|term| text_lower.contains(term.as_str()))
 }
 
 /// Process a single .emlx file and return SearchResult if it matches the query.
@@ -116,33 +126,49 @@ pub fn process_emlx_file(
     path: &std::path::Path,
     query: &str,
 ) -> Option<crate::models::SearchResult> {
-    let content = std::fs::read_to_string(path).ok()?;
+    // Pre-process query terms once
+    let lowercase_terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+    
+    process_emlx_file_with_terms(path, &lowercase_terms)
+}
+
+/// Process a single .emlx file with pre-processed search terms.
+/// This is more efficient when processing multiple files with the same query.
+pub fn process_emlx_file_with_terms(
+    path: &std::path::Path,
+    lowercase_terms: &[String],
+) -> Option<crate::models::SearchResult> {
+    // Read file as bytes to avoid UTF-8 validation overhead initially
+    let content = std::fs::read(path).ok()?;
 
     // .emlx format:
-    // Line 1: Byte count
+    // Line 1: Byte count (ASCII)
     // Line 2+: MIME content
-    let lines = content.lines().collect::<Vec<_>>();
-    if lines.is_empty() {
-        return None;
-    }
-
-    // First line is byte count, skip it
-    let mime_content = &content[lines[0].len() + 1..];
-    let bytes = mime_content.as_bytes();
+    // Find the first newline to skip the byte count line
+    let newline_pos = content.iter().position(|&b| b == b'\n')?;
+    
+    // MIME content starts after first newline
+    let mime_content = &content[newline_pos + 1..];
 
     // Parse as email
-    let mail = mailparse::parse_mail(bytes).ok()?;
+    let mail = mailparse::parse_mail(mime_content).ok()?;
 
-    // Extract text content
+    // Early exit: Check headers first before extracting full body
+    // This can save significant work if the match is in headers
+    let subject = extract_header(&mail, "Subject", NO_SUBJECT);
+    let from_addr = extract_header(&mail, "From", UNKNOWN_SENDER);
+    
+    // Extract full text content (includes headers and body)
     let text_content = extract_email_text(&mail, true);
-
+    
     // Check if matches query
-    if !matches_query(&text_content, query) {
+    if !matches_query_with_terms(&text_content, lowercase_terms) {
         return None;
     }
 
-    let subject = extract_header(&mail, "Subject", NO_SUBJECT);
-    let from_addr = extract_header(&mail, "From", UNKNOWN_SENDER);
     let date_str = format_date(mail.get_headers().get_first_value("Date").as_deref());
 
     Some(crate::models::SearchResult {
@@ -152,4 +178,85 @@ pub fn process_emlx_file(
         file_path: path.display().to_string(),
         content: text_content,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_matches_query_single_term() {
+        assert!(matches_query("Hello World", "hello"));
+        assert!(matches_query("Hello World", "world"));
+        assert!(!matches_query("Hello World", "foo"));
+    }
+
+    #[test]
+    fn test_matches_query_multiple_terms() {
+        assert!(matches_query("Hello World from Rust", "hello rust"));
+        assert!(matches_query("Hello World from Rust", "world from"));
+        assert!(!matches_query("Hello World from Rust", "hello python"));
+    }
+
+    #[test]
+    fn test_matches_query_case_insensitive() {
+        assert!(matches_query("Hello World", "HELLO"));
+        assert!(matches_query("HELLO WORLD", "hello"));
+        assert!(matches_query("HeLLo WoRLd", "hELLo wORld"));
+    }
+
+    #[test]
+    fn test_matches_query_with_terms() {
+        let terms = vec!["hello".to_string(), "world".to_string()];
+        assert!(matches_query_with_terms("Hello World", &terms));
+        assert!(!matches_query_with_terms("Hello There", &terms));
+    }
+
+    #[test]
+    fn test_matches_query_with_terms_empty() {
+        let terms: Vec<String> = vec![];
+        assert!(matches_query_with_terms("Hello World", &terms));
+    }
+
+    #[test]
+    fn test_strip_html_tags() {
+        let html = "<p>Hello <strong>World</strong>!</p>";
+        let text = strip_html_tags(html);
+        assert_eq!(text, "Hello World !");
+    }
+
+    #[test]
+    fn test_clean_header_value() {
+        let value = "Subject:\r\n with newlines";
+        let cleaned = clean_header_value(value);
+        assert_eq!(cleaned, "Subject:   with newlines"); // \r and \n each become space
+    }
+
+    #[test]
+    fn test_process_emlx_file_with_terms() {
+        // Create a temporary test email file
+        let test_dir = std::env::temp_dir().join("mailsearch_test");
+        std::fs::create_dir_all(&test_dir).unwrap();
+        
+        let test_file = test_dir.join("test.emlx");
+        let content = "365\nFrom: test@example.com\nTo: user@example.com\nSubject: Rust Programming\nDate: Mon, 1 Jan 2024 12:00:00 +0000\nContent-Type: text/plain; charset=utf-8\n\nThis is a test email about Rust performance.";
+        std::fs::write(&test_file, content).unwrap();
+
+        // Test matching query
+        let terms = vec!["rust".to_string(), "performance".to_string()];
+        let result = process_emlx_file_with_terms(&test_file, &terms);
+        assert!(result.is_some());
+        let result = result.unwrap();
+        assert!(result.subject.contains("Rust"));
+        assert!(result.content.contains("performance"));
+
+        // Test non-matching query
+        let terms = vec!["python".to_string()];
+        let result = process_emlx_file_with_terms(&test_file, &terms);
+        assert!(result.is_none());
+
+        // Cleanup
+        std::fs::remove_file(test_file).ok();
+        std::fs::remove_dir(test_dir).ok();
+    }
 }

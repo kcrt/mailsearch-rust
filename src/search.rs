@@ -1,6 +1,5 @@
 //! Search functionality for finding and processing email files.
 
-use crate::email::process_emlx_file;
 use crate::models::SearchResult;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator, ProgressStyle};
 use rayon::prelude::*;
@@ -29,12 +28,20 @@ pub fn search_messages(mail_root: &Path, query: &str, limit: usize) -> Vec<Searc
             .progress_chars("##-"),
     );
 
+    // Pre-process query terms once for all file processing
+    let lowercase_terms: Vec<String> = query
+        .split_whitespace()
+        .map(|term| term.to_ascii_lowercase())
+        .collect();
+
     if limit < usize::MAX {
         // Use sequential iteration with early termination when limit is set
         files
             .into_iter()
             .progress_with(pb)
-            .filter_map(|emlx_file| process_emlx_file(&emlx_file, query))
+            .filter_map(|emlx_file| {
+                crate::email::process_emlx_file_with_terms(&emlx_file, &lowercase_terms)
+            })
             .take(limit)
             .collect()
     } else {
@@ -42,7 +49,9 @@ pub fn search_messages(mail_root: &Path, query: &str, limit: usize) -> Vec<Searc
         files
             .into_par_iter()
             .progress_with(pb)
-            .filter_map(|emlx_file| process_emlx_file(&emlx_file, query))
+            .filter_map(|emlx_file| {
+                crate::email::process_emlx_file_with_terms(&emlx_file, &lowercase_terms)
+            })
             .collect()
     }
 }
