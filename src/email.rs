@@ -40,7 +40,9 @@ pub fn strip_html_tags(html: &str) -> String {
 
 /// Clean embedded newlines from header values.
 pub fn clean_header_value(value: &str) -> String {
-    value.replace('\r', " ").replace('\n', " ")
+    value.chars()
+        .map(|c| if c == '\r' || c == '\n' { ' ' } else { c })
+        .collect()
 }
 
 /// Extract header value safely.
