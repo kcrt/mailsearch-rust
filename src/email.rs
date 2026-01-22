@@ -104,6 +104,10 @@ fn extract_body_text(mail: &mailparse::ParsedMail<'_>, text_parts: &mut Vec<Stri
 }
 
 /// Check if text matches the search query (all terms must be present).
+/// 
+/// Note: This function processes query terms on each call. For batch processing
+/// of multiple documents with the same query, use `matches_query_with_terms()` 
+/// with pre-processed terms for better performance.
 pub fn matches_query(text: &str, query: &str) -> bool {
     // Pre-process query terms to lowercase once
     let lowercase_terms: Vec<String> = query
@@ -118,7 +122,7 @@ pub fn matches_query(text: &str, query: &str) -> bool {
 /// This is more efficient when matching multiple documents with the same query.
 pub fn matches_query_with_terms(text: &str, lowercase_terms: &[String]) -> bool {
     let text_lower = text.to_ascii_lowercase();
-    lowercase_terms.iter().all(|term| text_lower.contains(term.as_str()))
+    lowercase_terms.iter().all(|term| text_lower.contains(term))
 }
 
 /// Process a single .emlx file and return SearchResult if it matches the query.
@@ -156,12 +160,7 @@ pub fn process_emlx_file_with_terms(
     // Parse as email
     let mail = mailparse::parse_mail(mime_content).ok()?;
 
-    // Early exit: Check headers first before extracting full body
-    // This can save significant work if the match is in headers
-    let subject = extract_header(&mail, "Subject", NO_SUBJECT);
-    let from_addr = extract_header(&mail, "From", UNKNOWN_SENDER);
-    
-    // Extract full text content (includes headers and body)
+    // Extract text content (includes headers and body)
     let text_content = extract_email_text(&mail, true);
     
     // Check if matches query
@@ -169,6 +168,9 @@ pub fn process_emlx_file_with_terms(
         return None;
     }
 
+    // Only extract metadata if we have a match
+    let subject = extract_header(&mail, "Subject", NO_SUBJECT);
+    let from_addr = extract_header(&mail, "From", UNKNOWN_SENDER);
     let date_str = format_date(mail.get_headers().get_first_value("Date").as_deref());
 
     Some(crate::models::SearchResult {
