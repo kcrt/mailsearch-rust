@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use regex::Regex;
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Alignment, Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -377,12 +377,23 @@ fn get_highlighted_text<'a>(text: &'a str, query: &str) -> Vec<Line<'a>> {
 fn draw_ui(f: &mut Frame, app: &App) {
     let size = f.area();
 
-    // Split into top (results list) and bottom (content preview)
+    // Split into top (results list) and bottom (content preview + help)
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(0)
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)].as_ref())
         .split(size);
+
+    // Split the bottom section into content and help areas
+    let help_height = 3;
+    let bottom_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(0)
+        .constraints([
+            Constraint::Min(1),
+            Constraint::Length(help_height),
+        ].as_ref())
+        .split(chunks[1]);
 
     // Results list
     let items: Vec<ListItem> = app
@@ -441,7 +452,7 @@ fn draw_ui(f: &mut Frame, app: &App) {
         .wrap(Wrap { trim: false })
         .scroll((app.content_scroll as u16, 0));
 
-    f.render_widget(content_paragraph, chunks[1]);
+    f.render_widget(content_paragraph, bottom_chunks[0]);
 
     // Help footer
     let help_text = vec![
@@ -463,16 +474,8 @@ fn draw_ui(f: &mut Frame, app: &App) {
         .alignment(Alignment::Center)
         .block(Block::default().borders(Borders::ALL));
 
-    let help_height = 3;
-    let help_rect = Rect {
-        x: chunks[1].x,
-        y: chunks[1].bottom() - help_height,
-        width: chunks[1].width,
-        height: help_height,
-    };
-
-    // Draw help over the content area
-    f.render_widget(help_paragraph, help_rect);
+    // Draw help in its dedicated area
+    f.render_widget(help_paragraph, bottom_chunks[1]);
 }
 
 /// Run the TUI application.
