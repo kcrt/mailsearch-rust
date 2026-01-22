@@ -25,6 +25,7 @@ use std::time::Duration;
 enum FilterType {
     From(String),
     Subject(String),
+    All(String), // Search across all fields (from, subject, content)
     After(NaiveDate),
     Before(NaiveDate),
 }
@@ -127,15 +128,23 @@ impl App {
             self.filtered_indices = None;
         } else {
             let filters = parse_filter(&self.filter_input);
-            let mut matching_indices = Vec::new();
 
-            for (i, result) in self.results.iter().enumerate() {
-                if filters.iter().all(|filter| match_filter(filter, result)) {
-                    matching_indices.push(i);
+            // Only apply filter if valid filters were parsed
+            // (e.g., "unknown:filter" would be invalid, but plain text "hello" is valid)
+            if filters.is_empty() {
+                // Invalid filter format - show no results
+                self.filtered_indices = Some(Vec::new());
+            } else {
+                let mut matching_indices = Vec::new();
+
+                for (i, result) in self.results.iter().enumerate() {
+                    if filters.iter().all(|filter| match_filter(filter, result)) {
+                        matching_indices.push(i);
+                    }
                 }
-            }
 
-            self.filtered_indices = Some(matching_indices);
+                self.filtered_indices = Some(matching_indices);
+            }
         }
         self.selected = 0;
         self.content_scroll = 0;
@@ -185,7 +194,7 @@ fn parse_filter(input: &str) -> Vec<FilterType> {
     filters
 }
 
-/// Parse a single filter token like "from:john" or "after:2025-01-01".
+/// Parse a single filter token like "from:john", "after:2025-01-01", or just "hello".
 fn parse_single_filter(token: &str) -> Option<FilterType> {
     if let Some((filter_type, value)) = token.split_once(':') {
         match filter_type.to_lowercase().as_str() {
@@ -199,6 +208,9 @@ fn parse_single_filter(token: &str) -> Option<FilterType> {
                 .map(FilterType::Before),
             _ => None,
         }
+    } else if !token.is_empty() {
+        // No colon means search across all fields
+        Some(FilterType::All(token.to_string()))
     } else {
         None
     }
@@ -215,6 +227,12 @@ fn match_filter(filter: &FilterType, result: &SearchResult) -> bool {
             .subject
             .to_lowercase()
             .contains(&pattern.to_lowercase()),
+        FilterType::All(pattern) => {
+            let pattern_lower = pattern.to_lowercase();
+            result.from_addr.to_lowercase().contains(&pattern_lower)
+                || result.subject.to_lowercase().contains(&pattern_lower)
+                || result.content.to_lowercase().contains(&pattern_lower)
+        }
         FilterType::After(date) => {
             // Parse date from result.date_str (format: "%Y-%m-%d %H:%M")
             result.date_str
@@ -628,5 +646,107 @@ mod tests {
 
         let filter = FilterType::Before(NaiveDate::from_ymd_opt(2025, 1, 10).unwrap());
         assert!(!match_filter(&filter, &result));
+    }
+
+    #[test]
+    fn test_parse_filter_plain_text_searches_all() {
+        // Test that plain text (no colon) creates All filters
+        let filters = parse_filter("Hello");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterType::All(text) => assert_eq!(text, "Hello"),
+            _ => panic!("Expected All filter"),
+        }
+
+        // Test multiple words create multiple All filters (AND logic)
+        let filters = parse_filter("Hello World");
+        assert_eq!(filters.len(), 2);
+        match &filters[0] {
+            FilterType::All(text) => assert_eq!(text, "Hello"),
+            _ => panic!("Expected All filter"),
+        }
+        match &filters[1] {
+            FilterType::All(text) => assert_eq!(text, "World"),
+            _ => panic!("Expected All filter"),
+        }
+
+        // Test that invalid filter type returns empty list
+        let filters = parse_filter("unknown:filter");
+        assert_eq!(filters.len(), 0);
+    }
+
+    #[test]
+    fn test_apply_filter_with_invalid_input() {
+        let results = vec![
+            SearchResult {
+                subject: "Test Subject".to_string(),
+                from_addr: "john@example.com".to_string(),
+                date_str: "2025-01-15 10:00".to_string(),
+                file_path: "/path1".to_string(),
+                content: "Content".to_string(),
+            },
+        ];
+
+        let mut app = App::new(results, "test".to_string());
+
+        // Apply invalid filter type (unknown:) - should result in empty filtered_indices
+        app.filter_input = "unknown:filter".to_string();
+        app.apply_filter();
+
+        // Should have empty Some (no matches) instead of None (no filter)
+        assert!(app.filtered_indices.is_some());
+        assert_eq!(app.filtered_indices.as_ref().unwrap().len(), 0);
+
+        // Apply plain text filter - should search across all fields (no match)
+        app.filter_input = "nomatch".to_string();
+        app.apply_filter();
+
+        assert!(app.filtered_indices.is_some());
+        assert_eq!(app.filtered_indices.as_ref().unwrap().len(), 0);
+
+        // Apply plain text filter - should search across all fields (match)
+        app.filter_input = "test".to_string();
+        app.apply_filter();
+
+        assert!(app.filtered_indices.is_some());
+        assert_eq!(app.filtered_indices.as_ref().unwrap().len(), 1);
+
+        // Apply valid filter - should work normally
+        app.filter_input = "from:john".to_string();
+        app.apply_filter();
+
+        assert!(app.filtered_indices.is_some());
+        assert_eq!(app.filtered_indices.as_ref().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn test_match_filter_all() {
+        let result = SearchResult {
+            subject: "Project Update Meeting".to_string(),
+            from_addr: "john@example.com".to_string(),
+            date_str: "2025-01-15 10:00".to_string(),
+            file_path: "/path".to_string(),
+            content: "The project is progressing well with updates".to_string(),
+        };
+
+        // Match in subject
+        let filter = FilterType::All("project".to_string());
+        assert!(match_filter(&filter, &result));
+
+        // Match in from
+        let filter = FilterType::All("john".to_string());
+        assert!(match_filter(&filter, &result));
+
+        // Match in content
+        let filter = FilterType::All("progressing".to_string());
+        assert!(match_filter(&filter, &result));
+
+        // No match
+        let filter = FilterType::All("xyz".to_string());
+        assert!(!match_filter(&filter, &result));
+
+        // Case insensitive
+        let filter = FilterType::All("PROJECT".to_string());
+        assert!(match_filter(&filter, &result));
     }
 }

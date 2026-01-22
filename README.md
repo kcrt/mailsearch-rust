@@ -63,7 +63,7 @@ mailsearch -d ~/Library/Mail/V2 "project update"
 ## TUI Controls
 
 | Key | Action |
-|-----|--------|
+| :--- | :--- |
 | `↑` / `↓` or `j` / `k` | Navigate results |
 | `Enter` | Open email in default application |
 | `Space` | QuickLook preview |
@@ -77,15 +77,18 @@ mailsearch -d ~/Library/Mail/V2 "project update"
 Press `/` to enter filter mode and type filters to refine results:
 
 | Filter | Example | Description |
-|--------|---------|-------------|
+| :--- | :--- | :--- |
+| (plain text) | `Hello` | Search across all fields (from, subject, content) |
 | `from:` | `from:alice` | Filter by sender |
 | `subject:` | `subject:meeting` | Filter by subject |
 | `after:` | `after:2025-01-01` | Filter by date after |
 | `before:` | `before:2025-12-31` | Filter by date before |
 
 **Filter Tips:**
+
 - Use quotes for multi-word values: `subject:"project update"`
 - Combine multiple filters: `from:alice subject:meeting after:2025-01-01`
+- Plain text searches across sender, subject, AND content
 - Press `Enter` to apply, `Esc` to cancel
 - Text filters are case-insensitive
 - Clear active filter by pressing `Esc` in normal mode
@@ -127,13 +130,13 @@ cargo build --release
 
 ## TODO
 
-- [ ] Show spinner during initial emlx file search
+- [x] Show spinner during initial emlx file search ✅
 - [ ] Improve search performance
 - [x] Add filtering functionality in TUI ✅
-- [ ] Display date in content pane (currently shown only in upper listing pane)
-- [ ] Fix JIS character encoding display
-- [ ] Strip CSS from HTML content
-- [x] Implement tests (email.rs module completed)
+- [x] Display date in content pane ✅
+- [x] Fix JIS character encoding display ✅
+- [x] Strip CSS from HTML content ✅
+- [x] Implement tests (email.rs module completed) ✅
 
 ## License
 
