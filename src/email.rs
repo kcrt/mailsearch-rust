@@ -25,7 +25,7 @@ fn script_block_regex() -> &'static Regex {
 
 fn html_comment_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"<!--.*?-->").unwrap())
+    REGEX.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").unwrap())
 }
 
 fn whitespace_regex() -> &'static Regex {
