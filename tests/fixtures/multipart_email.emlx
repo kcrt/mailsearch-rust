@@ -1,0 +1,25 @@
+789
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>flags</key>
+	<integer>0</integer>
+</dict>
+</plist>
+From: multi@example.com
+To: user@example.com
+Subject: Multipart Email Test
+Date: Wed, 22 Jan 2026 09:00:00 +0000
+Content-Type: multipart/alternative; boundary="boundary123"
+
+--boundary123
+Content-Type: text/plain; charset=UTF-8
+
+Plain text version with project update information.
+
+--boundary123
+Content-Type: text/html; charset=UTF-8
+
+<html><body><p>HTML version with <strong>project update</strong> information.</p></body></html>
+--boundary123--

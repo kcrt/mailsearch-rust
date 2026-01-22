@@ -1,0 +1,22 @@
+456
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>flags</key>
+	<integer>0</integer>
+</dict>
+</plist>
+From: htmlsender@example.com
+To: htmlrecipient@example.com
+Subject: HTML Test Email
+Date: Tue, 21 Jan 2026 15:45:00 +0000
+Content-Type: text/html; charset=UTF-8
+
+<html>
+<body>
+<p>This is an <b>HTML</b> email.</p>
+<div>Contains <span style="color: red;">formatted</span> content.</div>
+<p>Testing search: invoice receipt</p>
+</body>
+</html>
