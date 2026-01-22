@@ -13,6 +13,21 @@ fn html_tag_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
 }
 
+fn style_block_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap())
+}
+
+fn script_block_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap())
+}
+
+fn html_comment_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"<!--.*?-->").unwrap())
+}
+
 fn whitespace_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"\s+").unwrap())
@@ -32,9 +47,17 @@ pub fn format_date(date_header: Option<&str>) -> String {
     "N/A".to_string()
 }
 
-/// Remove HTML tags and normalize whitespace.
+/// Remove HTML tags, CSS, scripts, and normalize whitespace.
 pub fn strip_html_tags(html: &str) -> String {
-    let text = html_tag_regex().replace_all(html, " ");
+    // Remove style blocks
+    let text = style_block_regex().replace_all(html, " ");
+    // Remove script blocks
+    let text = script_block_regex().replace_all(&text, " ");
+    // Remove HTML comments
+    let text = html_comment_regex().replace_all(&text, " ");
+    // Remove remaining HTML tags
+    let text = html_tag_regex().replace_all(&text, " ");
+    // Normalize whitespace
     whitespace_regex().replace_all(&text, " ").trim().to_string()
 }
 
@@ -152,4 +175,106 @@ pub fn process_emlx_file(
         file_path: path.display().to_string(),
         content: text_content,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_html_tags_basic() {
+        let html = "<p>Hello <b>World</b></p>";
+        assert_eq!(strip_html_tags(html), "Hello World");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_style_block() {
+        let html = "<style>body { color: red; }</style><p>Hello</p>";
+        assert_eq!(strip_html_tags(html), "Hello");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_multiline_style() {
+        let html = r#"<style>
+            body {
+                color: red;
+                font-size: 14px;
+            }
+        </style>
+        <p>Content</p>"#;
+        assert_eq!(strip_html_tags(html), "Content");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_script_block() {
+        let html = "<script>alert('test');</script><p>World</p>";
+        assert_eq!(strip_html_tags(html), "World");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_multiline_script() {
+        let html = r#"<script type="text/javascript">
+            function test() {
+                alert('test');
+            }
+        </script>
+        <p>Text</p>"#;
+        assert_eq!(strip_html_tags(html), "Text");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_html_comments() {
+        let html = "<!-- This is a comment --><p>Text</p>";
+        assert_eq!(strip_html_tags(html), "Text");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_multiline_comments() {
+        let html = r#"<!-- This is
+        a multiline
+        comment -->
+        <p>Content</p>"#;
+        assert_eq!(strip_html_tags(html), "Content");
+    }
+
+    #[test]
+    fn test_strip_html_tags_combined() {
+        let html = r#"
+        <style>body { color: red; }</style>
+        <script>alert('test');</script>
+        <!-- comment -->
+        <p>Final <b>Text</b></p>
+        "#;
+        assert_eq!(strip_html_tags(html), "Final Text");
+    }
+
+    #[test]
+    fn test_strip_html_tags_case_insensitive() {
+        let html = "<STYLE>body { color: red; }</STYLE><p>Hello</p>";
+        assert_eq!(strip_html_tags(html), "Hello");
+    }
+
+    #[test]
+    fn test_strip_html_tags_with_attributes() {
+        let html = r#"<style type="text/css">body { color: red; }</style><p>Hello</p>"#;
+        assert_eq!(strip_html_tags(html), "Hello");
+    }
+
+    #[test]
+    fn test_strip_html_tags_whitespace_normalization() {
+        let html = "<p>Hello    \n\n   World</p>";
+        assert_eq!(strip_html_tags(html), "Hello World");
+    }
+
+    #[test]
+    fn test_strip_html_tags_empty() {
+        let html = "";
+        assert_eq!(strip_html_tags(html), "");
+    }
+
+    #[test]
+    fn test_strip_html_tags_plain_text() {
+        let html = "Plain text without HTML";
+        assert_eq!(strip_html_tags(html), "Plain text without HTML");
+    }
 }
