@@ -21,25 +21,34 @@ use std::env;
 use std::path::PathBuf;
 use tui::run_tui;
 
+/// Expand tilde and resolve relative paths from home directory.
+fn expand_mail_root_path(mail_root: PathBuf) -> Result<PathBuf> {
+    // Expand tilde in path
+    let mut expanded = if mail_root.starts_with("~") {
+        let home = env::var("HOME").context("Could not determine HOME environment variable")?;
+        let rest = mail_root
+            .strip_prefix("~")
+            .unwrap_or(mail_root.as_path());
+        PathBuf::from(home).join(rest)
+    } else {
+        mail_root
+    };
+
+    // Handle relative path from home directory
+    if !expanded.is_absolute() {
+        expanded = dirs::home_dir()
+            .context("Could not determine home directory")?
+            .join(&expanded);
+    }
+
+    Ok(expanded)
+}
+
 fn main() -> Result<()> {
     let mut config = Config::parse();
 
-    // Expand tilde in path
-    if config.mail_root.starts_with("~") {
-        let home = env::var("HOME").context("Could not determine HOME environment variable")?;
-        let rest = config
-            .mail_root
-            .strip_prefix("~")
-            .unwrap_or_else(|_| config.mail_root.as_path());
-        config.mail_root = PathBuf::from(home).join(rest);
-    }
-
-    // Handle relative path from home directory
-    if !config.mail_root.is_absolute() {
-        config.mail_root = dirs::home_dir()
-            .context("Could not determine home directory")?
-            .join(&config.mail_root);
-    }
+    // Expand tilde and resolve relative paths
+    config.mail_root = expand_mail_root_path(config.mail_root)?;
 
     if !config.mail_root.exists() {
         eprintln!("Error: Mail directory not found:");

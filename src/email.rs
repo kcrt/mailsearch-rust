@@ -7,31 +7,22 @@ use mailparse::MailHeaderMap;
 use regex::Regex;
 use std::sync::OnceLock;
 
-/// Cached regex patterns for HTML stripping.
-fn html_tag_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
+/// Macro to generate cached regex functions.
+macro_rules! cached_regex {
+    ($name:ident, $pattern:literal) => {
+        fn $name() -> &'static Regex {
+            static REGEX: OnceLock<Regex> = OnceLock::new();
+            REGEX.get_or_init(|| Regex::new($pattern).unwrap())
+        }
+    };
 }
 
-fn style_block_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap())
-}
-
-fn script_block_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap())
-}
-
-fn html_comment_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").unwrap())
-}
-
-fn whitespace_regex() -> &'static Regex {
-    static REGEX: OnceLock<Regex> = OnceLock::new();
-    REGEX.get_or_init(|| Regex::new(r"\s+").unwrap())
-}
+// Cached regex patterns for HTML stripping.
+cached_regex!(html_tag_regex, r"<[^>]+>");
+cached_regex!(style_block_regex, r"(?is)<style[^>]*>.*?</style>");
+cached_regex!(script_block_regex, r"(?is)<script[^>]*>.*?</script>");
+cached_regex!(html_comment_regex, r"(?s)<!--.*?-->");
+cached_regex!(whitespace_regex, r"\s+");
 
 /// Format email date header to readable string.
 pub fn format_date(date_header: Option<&str>) -> String {
@@ -63,7 +54,7 @@ pub fn strip_html_tags(html: &str) -> String {
 
 /// Clean embedded newlines from header values.
 pub fn clean_header_value(value: &str) -> String {
-    value.replace('\r', " ").replace('\n', " ")
+    value.replace(['\r', '\n'], " ")
 }
 
 /// Extract header value safely.
