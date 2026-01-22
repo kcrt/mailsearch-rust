@@ -53,8 +53,7 @@ fn main() -> Result<()> {
 
     println!("Searching Mail files...");
     println!("   Directory: {}", config.mail_root.display());
-    println!("   Query: {}", config.query);
-    println!("   Scanning .emlx files...\n");
+    println!("   Query: {}\n", config.query);
 
     let results = search_messages(&config.mail_root, &config.query, config.limit);
 
