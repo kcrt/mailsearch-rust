@@ -9,13 +9,26 @@ use walkdir::WalkDir;
 
 /// Find all .emlx files in the Mail directory.
 pub fn find_emlx_files(mail_root: &Path) -> Vec<PathBuf> {
-    WalkDir::new(mail_root)
+    let spinner = ProgressBar::new_spinner();
+    spinner.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.cyan} {msg}")
+            .unwrap()
+            .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
+    );
+    spinner.set_message("Searching for .emlx files...");
+    spinner.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let files: Vec<PathBuf> = WalkDir::new(mail_root)
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
         .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "emlx"))
         .map(|entry| entry.path().to_path_buf())
-        .collect()
+        .collect();
+
+    spinner.finish_with_message(format!("Found {} .emlx files", files.len()));
+    files
 }
 
 /// Search for messages matching the query.
