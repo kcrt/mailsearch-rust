@@ -278,7 +278,7 @@ fn draw_ui(f: &mut Frame, app: &App) {
             } else {
                 Style::default()
             };
-            ListItem::new(format!("{} [{}] {}", result.from_addr, result.date_str, result.subject)).style(style)
+            ListItem::new(format!("{} {}", result.from_addr, result.subject)).style(style)
         })
         .collect();
 
@@ -305,7 +305,15 @@ fn draw_ui(f: &mut Frame, app: &App) {
 
     // Content preview
     let content = if let Some(result) = app.selected_result() {
-        result.content.clone()
+        // Format metadata header
+        let metadata = format!(
+            "From: {}\nDate: {}\nSubject: {}\n---\n{}",
+            result.from_addr,
+            result.date_str,
+            result.subject,
+            result.content
+        );
+        metadata
     } else {
         "No results".to_string()
     };
