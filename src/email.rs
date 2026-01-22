@@ -13,6 +13,21 @@ fn html_tag_regex() -> &'static Regex {
     REGEX.get_or_init(|| Regex::new(r"<[^>]+>").unwrap())
 }
 
+fn style_block_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<style[^>]*>.*?</style>").unwrap())
+}
+
+fn script_block_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?is)<script[^>]*>.*?</script>").unwrap())
+}
+
+fn html_comment_regex() -> &'static Regex {
+    static REGEX: OnceLock<Regex> = OnceLock::new();
+    REGEX.get_or_init(|| Regex::new(r"(?s)<!--.*?-->").unwrap())
+}
+
 fn whitespace_regex() -> &'static Regex {
     static REGEX: OnceLock<Regex> = OnceLock::new();
     REGEX.get_or_init(|| Regex::new(r"\s+").unwrap())
@@ -32,9 +47,17 @@ pub fn format_date(date_header: Option<&str>) -> String {
     "N/A".to_string()
 }
 
-/// Remove HTML tags and normalize whitespace.
+/// Remove HTML tags, CSS, scripts, and normalize whitespace.
 pub fn strip_html_tags(html: &str) -> String {
-    let text = html_tag_regex().replace_all(html, " ");
+    // Remove style blocks
+    let text = style_block_regex().replace_all(html, " ");
+    // Remove script blocks
+    let text = script_block_regex().replace_all(&text, " ");
+    // Remove HTML comments
+    let text = html_comment_regex().replace_all(&text, " ");
+    // Remove remaining HTML tags
+    let text = html_tag_regex().replace_all(&text, " ");
+    // Normalize whitespace
     whitespace_regex().replace_all(&text, " ").trim().to_string()
 }
 
