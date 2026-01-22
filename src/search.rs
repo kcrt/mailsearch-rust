@@ -23,7 +23,7 @@ pub fn find_emlx_files(mail_root: &Path) -> Vec<PathBuf> {
         .follow_links(false)
         .into_iter()
         .filter_map(|e| e.ok())
-        .filter(|entry| entry.path().extension().map_or(false, |ext| ext == "emlx"))
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "emlx"))
         .map(|entry| entry.path().to_path_buf())
         .collect();
 

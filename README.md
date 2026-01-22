@@ -37,7 +37,7 @@ mailsearch [OPTIONS] <QUERY>
 
 ### Options
 
-- `-d, --maildir <DIR>` - Path to Apple Mail directory (default: `~/Library/Mail`)
+- `-r, --mail-root <DIR>` - Path to Apple Mail directory (default: `~/Library/Mail/V10`)
 - `-l, --limit <N>` - Limit number of results (default: unlimited)
 
 ### Examples
@@ -57,7 +57,7 @@ mailsearch -l 20 "receipt invoice"
 Search a custom mail directory:
 
 ```bash
-mailsearch -d ~/Library/Mail/V2 "project update"
+mailsearch -r ~/Library/Mail/V2 "project update"
 ```
 
 ## TUI Controls

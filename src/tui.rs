@@ -234,19 +234,12 @@ fn match_filter(filter: &FilterType, result: &SearchResult) -> bool {
                 || result.content.to_lowercase().contains(&pattern_lower)
         }
         FilterType::After(date) => {
-            // Parse date from result.date_str (format: "%Y-%m-%d %H:%M")
-            result.date_str
-                .split_whitespace()
-                .next()
-                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            parse_date_from_result(result)
                 .map(|result_date| result_date >= *date)
                 .unwrap_or(false)
         }
         FilterType::Before(date) => {
-            result.date_str
-                .split_whitespace()
-                .next()
-                .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+            parse_date_from_result(result)
                 .map(|result_date| result_date <= *date)
                 .unwrap_or(false)
         }
@@ -393,6 +386,27 @@ fn draw_ui(f: &mut Frame, app: &App) {
     f.render_widget(help_paragraph, bottom_chunks[1]);
 }
 
+/// Helper to temporarily suspend terminal mode for external commands.
+fn with_terminal_suspended<R>(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    f: impl FnOnce() -> R,
+) -> R {
+    disable_raw_mode().unwrap();
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    ).unwrap();
+    let result = f();
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableMouseCapture
+    ).unwrap();
+    enable_raw_mode().unwrap();
+    result
+}
+
 /// Run QuickLook on a file (macOS only).
 fn ql_command(path: &str) -> Result<()> {
     std::process::Command::new("qlmanage")
@@ -400,6 +414,71 @@ fn ql_command(path: &str) -> Result<()> {
         .status()
         .context("Failed to execute qlmanage")?;
     Ok(())
+}
+
+/// Extract date from SearchResult date_str.
+fn parse_date_from_result(result: &SearchResult) -> Option<NaiveDate> {
+    result
+        .date_str
+        .split_whitespace()
+        .next()
+        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
+}
+
+/// Handle filter mode input.
+fn handle_filter_mode_input(app: &mut App, key: &crossterm::event::KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.exit_filter_mode(),
+        KeyCode::Enter => app.apply_filter(),
+        KeyCode::Backspace => app.delete_filter_char(),
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            app.clear_filter_input()
+        }
+        KeyCode::Char(c) => app.add_filter_char(c),
+        _ => {}
+    }
+}
+
+/// Handle normal mode input.
+fn handle_normal_mode_input(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    key: &crossterm::event::KeyEvent,
+) {
+    match key.code {
+        KeyCode::Char('q') => app.quit(),
+        KeyCode::Esc => {
+            if app.filtered_indices.is_some() {
+                app.clear_filter();
+            } else {
+                app.quit();
+            }
+        }
+        KeyCode::Char('/') => app.enter_filter_mode(),
+        KeyCode::Down | KeyCode::Char('j') => app.next(),
+        KeyCode::Up | KeyCode::Char('k') => app.previous(),
+        KeyCode::PageDown => app.scroll_content_down(10),
+        KeyCode::PageUp => app.scroll_content_up(10),
+        KeyCode::Enter => {
+            if let Some(result) = app.selected_result() {
+                with_terminal_suspended(terminal, || {
+                    if let Err(e) = open::that(&result.file_path) {
+                        eprintln!("Failed to open file: {}", e);
+                    }
+                });
+            }
+        }
+        KeyCode::Char(' ') => {
+            if let Some(result) = app.selected_result() {
+                with_terminal_suspended(terminal, || {
+                    if let Err(e) = ql_command(&result.file_path) {
+                        eprintln!("QuickLook failed: {}", e);
+                    }
+                });
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Run the TUI application.
@@ -423,85 +502,9 @@ pub fn run_tui(results: Vec<SearchResult>, query: String) -> Result<()> {
             if let event::Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     if app.filter_mode {
-                        // Filter input mode
-                        match key.code {
-                            KeyCode::Esc => app.exit_filter_mode(),
-                            KeyCode::Enter => app.apply_filter(),
-                            KeyCode::Backspace => app.delete_filter_char(),
-                            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                app.clear_filter_input()
-                            }
-                            KeyCode::Char(c) => app.add_filter_char(c),
-                            _ => {}
-                        }
+                        handle_filter_mode_input(&mut app, &key);
                     } else {
-                        // Normal mode
-                        match key.code {
-                            KeyCode::Char('q') => app.quit(),
-                            KeyCode::Esc => {
-                                if app.filtered_indices.is_some() {
-                                    app.clear_filter();
-                                } else {
-                                    app.quit();
-                                }
-                            }
-                            KeyCode::Char('/') => app.enter_filter_mode(),
-                            KeyCode::Down | KeyCode::Char('j') => app.next(),
-                            KeyCode::Up | KeyCode::Char('k') => app.previous(),
-                            KeyCode::PageDown => app.scroll_content_down(10),
-                            KeyCode::PageUp => app.scroll_content_up(10),
-                            KeyCode::Enter => {
-                                if let Some(result) = app.selected_result() {
-                                    // Leave TUI mode temporarily
-                                    disable_raw_mode()?;
-                                    execute!(
-                                        terminal.backend_mut(),
-                                        LeaveAlternateScreen,
-                                        DisableMouseCapture
-                                    )?;
-
-                                    // Open file
-                                    #[allow(clippy::empty_single_line)]
-                                    if let Err(e) = open::that(&result.file_path) {
-                                        eprintln!("Failed to open file: {}", e);
-                                    }
-
-                                    // Restore TUI mode
-                                    execute!(
-                                        terminal.backend_mut(),
-                                        EnterAlternateScreen,
-                                        EnableMouseCapture
-                                    )?;
-                                    enable_raw_mode()?;
-                                }
-                            }
-                            KeyCode::Char(' ') => {
-                                if let Some(result) = app.selected_result() {
-                                    // Leave TUI mode temporarily
-                                    disable_raw_mode()?;
-                                    execute!(
-                                        terminal.backend_mut(),
-                                        LeaveAlternateScreen,
-                                        DisableMouseCapture
-                                    )?;
-
-                                    // QuickLook
-                                    #[allow(clippy::empty_single_line)]
-                                    if let Err(e) = ql_command(&result.file_path) {
-                                        eprintln!("QuickLook failed: {}", e);
-                                    }
-
-                                    // Restore TUI mode
-                                    execute!(
-                                        terminal.backend_mut(),
-                                        EnterAlternateScreen,
-                                        EnableMouseCapture
-                                    )?;
-                                    enable_raw_mode()?;
-                                }
-                            }
-                            _ => {}
-                        }
+                        handle_normal_mode_input(&mut app, &mut terminal, &key);
                     }
                 }
             }
