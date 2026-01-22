@@ -356,8 +356,12 @@ fn get_highlighted_text<'a>(text: &'a str, query: &str) -> Vec<Line<'a>> {
             current_col += word_len;
         }
 
-        // Push the line even if empty to preserve blank lines
-        lines.push(Line::from(current_line));
+        // Push the line, adding an empty span for blank lines to ensure they render
+        if current_line.is_empty() {
+            lines.push(Line::from(vec![Span::raw("")]));
+        } else {
+            lines.push(Line::from(current_line));
+        }
     }
 
     if lines.is_empty() {
