@@ -324,38 +324,46 @@ fn get_highlighted_text<'a>(text: &'a str, query: &str) -> Vec<Line<'a>> {
     // Simple word-wrapping at terminal width (rough approximation)
     let line_width = 100;
 
-    let mut current_line = Vec::new();
-    let mut current_col = 0;
+    // Process text line-by-line to preserve newlines
+    for text_line in text.lines() {
+        let mut current_line = Vec::new();
+        let mut current_col = 0;
 
-    for word in text.split_whitespace() {
-        let word_len = word.width() + 1; // +1 for space
-        if current_col + word_len > line_width && !current_line.is_empty() {
-            lines.push(Line::from(current_line.clone()));
-            current_line.clear();
-            current_col = 0;
+        // Apply word wrapping and highlighting to each line
+        for word in text_line.split_whitespace() {
+            let word_len = word.width() + 1; // +1 for space
+            if current_col + word_len > line_width && !current_line.is_empty() {
+                lines.push(Line::from(current_line.clone()));
+                current_line.clear();
+                current_col = 0;
+            }
+
+            let word_lower = word.to_ascii_lowercase();
+            let is_match = terms.iter().any(|term| word_lower.contains(term));
+
+            let span = if is_match {
+                Span::styled(
+                    word.to_string(),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                Span::raw(word.to_string())
+            };
+
+            current_line.push(span);
+            current_line.push(Span::raw(" "));
+            current_col += word_len;
         }
 
-        let word_lower = word.to_ascii_lowercase();
-        let is_match = terms.iter().any(|term| word_lower.contains(term));
-
-        let span = if is_match {
-            Span::styled(
-                word.to_string(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            )
+        // Push the current line (even if empty) to preserve blank lines
+        if !current_line.is_empty() {
+            lines.push(Line::from(current_line));
         } else {
-            Span::raw(word.to_string())
-        };
-
-        current_line.push(span);
-        current_line.push(Span::raw(" "));
-        current_col += word_len;
-    }
-
-    if !current_line.is_empty() {
-        lines.push(Line::from(current_line));
+            // Empty line - preserve it
+            lines.push(Line::from(Span::raw("")));
+        }
     }
 
     if lines.is_empty() {
