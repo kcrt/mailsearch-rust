@@ -1,0 +1,15 @@
+101
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>flags</key>
+	<integer>0</integer>
+</dict>
+</plist>
+From: nosubject@example.com
+To: test@example.com
+Date: Thu, 23 Jan 2026 12:00:00 +0000
+Content-Type: text/plain; charset=UTF-8
+
+Email without subject header.
