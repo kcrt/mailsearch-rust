@@ -133,7 +133,7 @@ cargo build --release
 - [ ] Display date in content pane (currently shown only in upper listing pane)
 - [ ] Fix JIS character encoding display
 - [ ] Strip CSS from HTML content
-- [x] Implement tests ✅ (9 tests for filter functionality)
+- [x] Implement tests (email.rs module completed)
 
 ## License
 

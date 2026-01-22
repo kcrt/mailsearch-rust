@@ -1,0 +1,18 @@
+123
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>flags</key>
+	<integer>0</integer>
+</dict>
+</plist>
+From: sender@example.com
+To: recipient@example.com
+Subject: Test Plain Text Email
+Date: Mon, 20 Jan 2026 10:30:00 +0000
+Content-Type: text/plain; charset=UTF-8
+
+This is a plain text email for testing.
+It contains multiple lines.
+Search term: rust programming
