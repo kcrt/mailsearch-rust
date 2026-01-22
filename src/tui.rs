@@ -493,3 +493,132 @@ pub fn run_tui(results: Vec<SearchResult>, query: String) -> Result<()> {
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_filter_from() {
+        let filters = parse_filter("from:john");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterType::From(value) => assert_eq!(value, "john"),
+            _ => panic!("Expected From filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_subject() {
+        let filters = parse_filter("subject:meeting");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterType::Subject(value) => assert_eq!(value, "meeting"),
+            _ => panic!("Expected Subject filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_with_quotes() {
+        let filters = parse_filter("subject:\"project update\"");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterType::Subject(value) => assert_eq!(value, "project update"),
+            _ => panic!("Expected Subject filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_multiple() {
+        let filters = parse_filter("from:john subject:meeting");
+        assert_eq!(filters.len(), 2);
+        match &filters[0] {
+            FilterType::From(value) => assert_eq!(value, "john"),
+            _ => panic!("Expected From filter"),
+        }
+        match &filters[1] {
+            FilterType::Subject(value) => assert_eq!(value, "meeting"),
+            _ => panic!("Expected Subject filter"),
+        }
+    }
+
+    #[test]
+    fn test_parse_filter_date() {
+        let filters = parse_filter("after:2025-01-01");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterType::After(date) => {
+                assert_eq!(date.to_string(), "2025-01-01");
+            }
+            _ => panic!("Expected After filter"),
+        }
+    }
+
+    #[test]
+    fn test_match_filter_from() {
+        let result = SearchResult {
+            subject: "Test".to_string(),
+            from_addr: "John Doe <john@example.com>".to_string(),
+            date_str: "2025-01-15 10:00".to_string(),
+            file_path: "/path".to_string(),
+            content: "Content".to_string(),
+        };
+
+        let filter = FilterType::From("john".to_string());
+        assert!(match_filter(&filter, &result));
+
+        let filter = FilterType::From("jane".to_string());
+        assert!(!match_filter(&filter, &result));
+    }
+
+    #[test]
+    fn test_match_filter_subject() {
+        let result = SearchResult {
+            subject: "Project Update Meeting".to_string(),
+            from_addr: "sender@example.com".to_string(),
+            date_str: "2025-01-15 10:00".to_string(),
+            file_path: "/path".to_string(),
+            content: "Content".to_string(),
+        };
+
+        let filter = FilterType::Subject("project".to_string());
+        assert!(match_filter(&filter, &result));
+
+        let filter = FilterType::Subject("invoice".to_string());
+        assert!(!match_filter(&filter, &result));
+    }
+
+    #[test]
+    fn test_match_filter_after() {
+        let result = SearchResult {
+            subject: "Test".to_string(),
+            from_addr: "sender@example.com".to_string(),
+            date_str: "2025-01-15 10:00".to_string(),
+            file_path: "/path".to_string(),
+            content: "Content".to_string(),
+        };
+
+        let filter = FilterType::After(NaiveDate::from_ymd_opt(2025, 1, 10).unwrap());
+        assert!(match_filter(&filter, &result));
+
+        let filter = FilterType::After(NaiveDate::from_ymd_opt(2025, 1, 20).unwrap());
+        assert!(!match_filter(&filter, &result));
+    }
+
+    #[test]
+    fn test_match_filter_before() {
+        let result = SearchResult {
+            subject: "Test".to_string(),
+            from_addr: "sender@example.com".to_string(),
+            date_str: "2025-01-15 10:00".to_string(),
+            file_path: "/path".to_string(),
+            content: "Content".to_string(),
+        };
+
+        let filter = FilterType::Before(NaiveDate::from_ymd_opt(2025, 1, 20).unwrap());
+        assert!(match_filter(&filter, &result));
+
+        let filter = FilterType::Before(NaiveDate::from_ymd_opt(2025, 1, 10).unwrap());
+        assert!(!match_filter(&filter, &result));
+    }
+}
