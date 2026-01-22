@@ -65,9 +65,32 @@ mailsearch -d ~/Library/Mail/V2 "project update"
 | Key | Action |
 |-----|--------|
 | `↑` / `↓` or `j` / `k` | Navigate results |
-| `Enter` | QuickLook preview |
-| `o` | Open in default mail application |
-| `q` / `Ctrl+C` | Quit |
+| `Enter` | Open email in default application |
+| `Space` | QuickLook preview |
+| `/` | Enter filter mode |
+| `Esc` | Exit filter mode or clear active filter |
+| `PgUp` / `PgDn` | Scroll content preview |
+| `q` | Quit |
+
+### Filter Mode
+
+Press `/` to enter filter mode and type filters to refine results:
+
+| Filter | Example | Description |
+|--------|---------|-------------|
+| `from:` | `from:alice` | Filter by sender |
+| `subject:` | `subject:meeting` | Filter by subject |
+| `after:` | `after:2025-01-01` | Filter by date after |
+| `before:` | `before:2025-12-31` | Filter by date before |
+
+**Filter Tips:**
+- Use quotes for multi-word values: `subject:"project update"`
+- Combine multiple filters: `from:alice subject:meeting after:2025-01-01`
+- Press `Enter` to apply, `Esc` to cancel
+- Text filters are case-insensitive
+- Clear active filter by pressing `Esc` in normal mode
+
+See [FILTER_FEATURE.md](FILTER_FEATURE.md) for detailed filter documentation.
 
 ## Requirements
 
@@ -106,7 +129,7 @@ cargo build --release
 
 - [ ] Show spinner during initial emlx file search
 - [ ] Improve search performance
-- [ ] Add filtering functionality in TUI
+- [x] Add filtering functionality in TUI ✅
 - [ ] Display date in content pane (currently shown only in upper listing pane)
 - [ ] Fix JIS character encoding display
 - [ ] Strip CSS from HTML content
