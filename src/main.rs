@@ -419,12 +419,10 @@ fn draw_ui(f: &mut Frame, app: &App) {
     // Content preview
     let content = if let Some(result) = app.selected_result() {
         let header = format!(
-            "From: {}\nSubject: {}\nDate: {}\nFile: {}\n\n{}",
+            "From: {}\nSubject: {}\nDate: {}",
             result.from_addr,
             result.subject,
-            result.date_str,
-            result.file_path,
-            "-".repeat(80)
+            result.date_str
         );
         format!("{}\n\n{}", header, result.content)
     } else {
