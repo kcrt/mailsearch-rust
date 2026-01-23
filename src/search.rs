@@ -28,6 +28,14 @@ pub fn find_emlx_files(mail_root: &Path) -> Vec<PathBuf> {
         .collect();
 
     spinner.finish_with_message(format!("Found {} .emlx files", files.len()));
+
+    if files.is_empty() {
+        eprintln!("\nError: No .emlx files found in the Mail directory.");
+        eprintln!("\nPlease ensure that the Mail directory is correct and accessible from this tool.");
+        eprintln!("\n    Directory: {}", mail_root.display());
+        std::process::exit(1);
+    }
+
     files
 }
 

@@ -12,6 +12,8 @@ pub enum TextPart<'a> {
 pub struct SearchResult {
     pub subject: String,
     pub from_addr: String,
+    pub to_addr: String,
+    pub cc_addr: String,
     pub date_str: String,
     pub file_path: String,
     pub content: String,

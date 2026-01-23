@@ -145,8 +145,8 @@ pub fn process_emlx_file(
     // Parse as email
     let mail = mailparse::parse_mail(bytes).ok()?;
 
-    // Extract text content
-    let text_content = extract_email_text(&mail, true);
+    // Extract text content (without headers, since they're displayed separately in UI)
+    let text_content = extract_email_text(&mail, false);
 
     // Check if matches query
     if !matches_query(&text_content, query) {
@@ -155,11 +155,15 @@ pub fn process_emlx_file(
 
     let subject = extract_header(&mail, "Subject", NO_SUBJECT);
     let from_addr = extract_header(&mail, "From", UNKNOWN_SENDER);
+    let to_addr = extract_header(&mail, "To", "");
+    let cc_addr = extract_header(&mail, "Cc", "");
     let date_str = format_date(mail.get_headers().get_first_value("Date").as_deref());
 
     Some(crate::models::SearchResult {
         subject,
         from_addr,
+        to_addr,
+        cc_addr,
         date_str,
         file_path: path.display().to_string(),
         content: text_content,
