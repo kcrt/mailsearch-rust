@@ -2,6 +2,12 @@
 name = "mailsearch"
 version = "0.1.0"
 edition = "2021"
+authors = ["Kyohei Takahashi <kcrt@kcrt.net>"]
+description = "A fast full-text search tool for Apple Mail .emlx files with an interactive terminal UI"
+repository = "https://github.com/kcrt/mailsearch-rust"
+license = "MIT"
+keywords = ["email", "search", "macos", "tui", "mail"]
+categories = ["command-line-utilities", "email"]
 
 [dependencies]
 anyhow = "1.0"
