@@ -30,6 +30,41 @@ enum FilterType {
     Before(NaiveDate),
 }
 
+/// Sort mode for ordering search results.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SortMode {
+    NoSort,
+    DateAsc,
+    DateDesc,
+    Subject,
+    From,
+    To,
+}
+
+impl SortMode {
+    fn next(self) -> Self {
+        match self {
+            SortMode::NoSort => SortMode::DateAsc,
+            SortMode::DateAsc => SortMode::DateDesc,
+            SortMode::DateDesc => SortMode::Subject,
+            SortMode::Subject => SortMode::From,
+            SortMode::From => SortMode::To,
+            SortMode::To => SortMode::NoSort,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        match self {
+            SortMode::NoSort => "no sort",
+            SortMode::DateAsc => "date asc",
+            SortMode::DateDesc => "date desc",
+            SortMode::Subject => "subject",
+            SortMode::From => "from",
+            SortMode::To => "to",
+        }
+    }
+}
+
 /// TUI Application state.
 pub struct App {
     pub results: Vec<SearchResult>,
@@ -40,6 +75,8 @@ pub struct App {
     pub filter_input: String,
     pub filter_mode: bool,
     pub filtered_indices: Option<Vec<usize>>,
+    sort_mode: SortMode,
+    sorted_indices: Option<Vec<usize>>,
 }
 
 impl App {
@@ -53,19 +90,91 @@ impl App {
             filter_input: String::new(),
             filter_mode: false,
             filtered_indices: None,
+            sort_mode: SortMode::NoSort,
+            sorted_indices: None,
         }
+    }
+
+    pub fn cycle_sort_mode(&mut self) {
+        self.sort_mode = self.sort_mode.next();
+        self.apply_sort();
+        self.selected = 0;
+        self.content_scroll = 0;
+    }
+
+    fn apply_sort(&mut self) {
+        if self.sort_mode == SortMode::NoSort {
+            self.sorted_indices = None;
+            return;
+        }
+
+        // Get base indices (either filtered or all)
+        let base_indices: Vec<usize> = if let Some(ref filtered) = self.filtered_indices {
+            filtered.clone()
+        } else {
+            (0..self.results.len()).collect()
+        };
+
+        let mut sorted: Vec<usize> = base_indices;
+        sorted.sort_by(|&a, &b| {
+            let result_a = &self.results[a];
+            let result_b = &self.results[b];
+            match self.sort_mode {
+                SortMode::NoSort => std::cmp::Ordering::Equal,
+                SortMode::DateAsc => {
+                    let date_a = parse_date_from_result(result_a);
+                    let date_b = parse_date_from_result(result_b);
+                    date_a.cmp(&date_b)
+                }
+                SortMode::DateDesc => {
+                    let date_a = parse_date_from_result(result_a);
+                    let date_b = parse_date_from_result(result_b);
+                    date_b.cmp(&date_a)
+                }
+                SortMode::Subject => {
+                    result_a.subject.to_lowercase().cmp(&result_b.subject.to_lowercase())
+                }
+                SortMode::From => {
+                    result_a.from_addr.to_lowercase().cmp(&result_b.from_addr.to_lowercase())
+                }
+                SortMode::To => {
+                    result_a.to_addr.to_lowercase().cmp(&result_b.to_addr.to_lowercase())
+                }
+            }
+        });
+
+        self.sorted_indices = Some(sorted);
     }
 
     pub fn selected_result(&self) -> Option<&SearchResult> {
-        if let Some(ref indices) = self.filtered_indices {
-            indices.get(self.selected).and_then(|&i| self.results.get(i))
+        // Get the index based on sorted -> filtered -> direct
+        // If both filters are applied, sorted contains filtered + sorted indices
+        let idx = if let Some(ref sorted) = self.sorted_indices {
+            sorted.get(self.selected).copied()
+        } else if let Some(ref filtered) = self.filtered_indices {
+            filtered.get(self.selected).copied()
         } else {
-            self.results.get(self.selected)
-        }
+            Some(self.selected)
+        };
+        idx.and_then(|i| self.results.get(i))
     }
 
     pub fn visible_results_count(&self) -> usize {
-        self.filtered_indices.as_ref().map_or(self.results.len(), |v| v.len())
+        if let Some(ref sorted) = self.sorted_indices {
+            sorted.len()
+        } else {
+            self.filtered_indices.as_ref().map_or(self.results.len(), |v| v.len())
+        }
+    }
+
+    fn get_visible_indices(&self) -> Vec<usize> {
+        if let Some(ref sorted) = self.sorted_indices {
+            sorted.clone()
+        } else if let Some(ref filtered) = self.filtered_indices {
+            filtered.clone()
+        } else {
+            (0..self.results.len()).collect()
+        }
     }
 
     pub fn next(&mut self) {
@@ -107,8 +216,10 @@ impl App {
     pub fn clear_filter(&mut self) {
         self.filter_input.clear();
         self.filtered_indices = None;
+        self.sorted_indices = None; // Clear sort when clearing filter
         self.selected = 0;
         self.content_scroll = 0;
+        self.apply_sort(); // Reapply sort to all results
     }
 
     pub fn add_filter_char(&mut self, c: char) {
@@ -149,6 +260,7 @@ impl App {
         self.selected = 0;
         self.content_scroll = 0;
         self.filter_mode = false;
+        self.apply_sort(); // Reapply sort to filtered results
     }
 }
 
@@ -270,12 +382,12 @@ fn draw_ui(f: &mut Frame, app: &App) {
         ].as_ref())
         .split(chunks[1]);
 
-    // Get visible results based on filter
-    let visible_results: Vec<(usize, &SearchResult)> = if let Some(ref indices) = app.filtered_indices {
-        indices.iter().map(|&i| (i, &app.results[i])).collect()
-    } else {
-        app.results.iter().enumerate().collect()
-    };
+    // Get visible results based on filter and sort
+    let visible_indices = app.get_visible_indices();
+    let visible_results: Vec<(usize, &SearchResult)> = visible_indices
+        .iter()
+        .map(|&i| (i, &app.results[i]))
+        .collect();
 
     // Results list
     let items: Vec<ListItem> = visible_results
@@ -293,10 +405,17 @@ fn draw_ui(f: &mut Frame, app: &App) {
         })
         .collect();
 
-    let title = if let Some(ref indices) = app.filtered_indices {
-        format!(" Results for: {} ({} filtered: {}) ", app.query, app.results.len(), indices.len())
+    // Build title with sort mode indicator
+    let sort_indicator = if app.sort_mode != SortMode::NoSort {
+        format!(" [sort: {}]", app.sort_mode.as_str())
     } else {
-        format!(" Results for: {} ({}) ", app.query, app.results.len())
+        String::new()
+    };
+
+    let title = if let Some(ref indices) = app.filtered_indices {
+        format!(" Results for: {} ({} filtered: {}){} ", app.query, app.results.len(), indices.len(), sort_indicator)
+    } else {
+        format!(" Results for: {} ({}){} ", app.query, app.results.len(), sort_indicator)
     };
 
     let list = List::new(items)
@@ -317,13 +436,24 @@ fn draw_ui(f: &mut Frame, app: &App) {
     // Content preview
     let content = if let Some(result) = app.selected_result() {
         // Format metadata header
-        let metadata = format!(
-            "From: {}\nDate: {}\nSubject: {}\n---\n{}",
+        let mut metadata = format!(
+            "From: {}\nDate: {}\nSubject: {}",
             result.from_addr,
             result.date_str,
-            result.subject,
-            result.content
+            result.subject
         );
+
+        // Add To if present
+        if !result.to_addr.is_empty() {
+            metadata.push_str(&format!("\nTo: {}", result.to_addr));
+        }
+
+        // Add Cc if present
+        if !result.cc_addr.is_empty() {
+            metadata.push_str(&format!("\nCc: {}", result.cc_addr));
+        }
+
+        metadata.push_str(&format!("\n---\n{}", result.content));
         metadata
     } else {
         "No results".to_string()
@@ -366,6 +496,8 @@ fn draw_ui(f: &mut Frame, app: &App) {
             Line::from(vec![
                 Span::styled(" ↑↓ ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::raw(" Navigate "),
+                Span::styled(" s ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::raw(" Sort "),
                 Span::styled(" Space ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::raw(" QuickLook "),
                 Span::styled(" Enter ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
@@ -447,6 +579,7 @@ fn handle_normal_mode_input(
 ) {
     match key.code {
         KeyCode::Char('q') => app.quit(),
+        KeyCode::Char('s') => app.cycle_sort_mode(),
         KeyCode::Esc => {
             if app.filtered_indices.is_some() {
                 app.clear_filter();
@@ -588,6 +721,8 @@ mod tests {
         let result = SearchResult {
             subject: "Test".to_string(),
             from_addr: "John Doe <john@example.com>".to_string(),
+            to_addr: "".to_string(),
+            cc_addr: "".to_string(),
             date_str: "2025-01-15 10:00".to_string(),
             file_path: "/path".to_string(),
             content: "Content".to_string(),
@@ -605,6 +740,8 @@ mod tests {
         let result = SearchResult {
             subject: "Project Update Meeting".to_string(),
             from_addr: "sender@example.com".to_string(),
+            to_addr: "".to_string(),
+            cc_addr: "".to_string(),
             date_str: "2025-01-15 10:00".to_string(),
             file_path: "/path".to_string(),
             content: "Content".to_string(),
@@ -622,6 +759,8 @@ mod tests {
         let result = SearchResult {
             subject: "Test".to_string(),
             from_addr: "sender@example.com".to_string(),
+            to_addr: "".to_string(),
+            cc_addr: "".to_string(),
             date_str: "2025-01-15 10:00".to_string(),
             file_path: "/path".to_string(),
             content: "Content".to_string(),
@@ -639,6 +778,8 @@ mod tests {
         let result = SearchResult {
             subject: "Test".to_string(),
             from_addr: "sender@example.com".to_string(),
+            to_addr: "".to_string(),
+            cc_addr: "".to_string(),
             date_str: "2025-01-15 10:00".to_string(),
             file_path: "/path".to_string(),
             content: "Content".to_string(),
@@ -684,6 +825,8 @@ mod tests {
             SearchResult {
                 subject: "Test Subject".to_string(),
                 from_addr: "john@example.com".to_string(),
+                to_addr: "".to_string(),
+                cc_addr: "".to_string(),
                 date_str: "2025-01-15 10:00".to_string(),
                 file_path: "/path1".to_string(),
                 content: "Content".to_string(),
@@ -727,6 +870,8 @@ mod tests {
         let result = SearchResult {
             subject: "Project Update Meeting".to_string(),
             from_addr: "john@example.com".to_string(),
+            to_addr: "".to_string(),
+            cc_addr: "".to_string(),
             date_str: "2025-01-15 10:00".to_string(),
             file_path: "/path".to_string(),
             content: "The project is progressing well with updates".to_string(),
