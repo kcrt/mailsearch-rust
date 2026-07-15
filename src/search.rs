@@ -40,7 +40,7 @@ pub fn find_emlx_files(mail_root: &Path) -> Vec<PathBuf> {
 }
 
 /// Search for messages matching the query.
-pub fn search_messages(mail_root: &Path, query: &str, limit: usize) -> Vec<SearchResult> {
+pub fn search_messages(mail_root: &Path, groups: &[Vec<String>], limit: usize) -> Vec<SearchResult> {
     let files = find_emlx_files(mail_root);
     let pb = ProgressBar::new(files.len() as u64);
     pb.set_style(
@@ -55,7 +55,7 @@ pub fn search_messages(mail_root: &Path, query: &str, limit: usize) -> Vec<Searc
         files
             .into_iter()
             .progress_with(pb)
-            .filter_map(|emlx_file| process_emlx_file(&emlx_file, query))
+            .filter_map(|emlx_file| process_emlx_file(&emlx_file, groups))
             .take(limit)
             .collect()
     } else {
@@ -63,7 +63,7 @@ pub fn search_messages(mail_root: &Path, query: &str, limit: usize) -> Vec<Searc
         files
             .into_par_iter()
             .progress_with(pb)
-            .filter_map(|emlx_file| process_emlx_file(&emlx_file, query))
+            .filter_map(|emlx_file| process_emlx_file(&emlx_file, groups))
             .collect()
     }
 }
