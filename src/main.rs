@@ -12,11 +12,13 @@ mod email;
 mod highlight;
 mod models;
 mod search;
+mod sort;
 mod tui;
 
 use anyhow::{Context, Result};
 use config::{Config, Parser};
 use search::search_messages;
+use sort::{sort_results, SortMode};
 use std::env;
 use std::path::PathBuf;
 use tui::run_tui;
@@ -60,17 +62,44 @@ fn main() -> Result<()> {
         std::process::exit(1);
     }
 
-    println!("Searching Mail files...");
-    println!("   Directory: {}", config.mail_root.display());
-    println!("   Query: {}\n", config.query);
+    // Build OR-groups (outer = OR, inner = AND terms) once, then reuse across the scan.
+    let groups = email::parse_query_groups(&config.query, &config.or_terms);
+    // Flattened, pre-lowercased term list for highlighting any matched term.
+    let highlight_terms: Vec<String> = groups.iter().flatten().cloned().collect();
+    // Human-readable query used for status messages and the TUI header.
+    let display_query = if config.or_terms.is_empty() {
+        config.query.clone()
+    } else {
+        format!("{} OR {}", config.query, config.or_terms.join(" OR "))
+    };
 
-    let results = search_messages(&config.mail_root, &config.query, config.limit);
+    // Status messages would corrupt stdout in JSON mode; suppress them there.
+    if !config.json {
+        println!("Searching Mail files...");
+        println!("   Directory: {}", config.mail_root.display());
+        println!("   Query: {}\n", display_query);
+    }
 
-    if results.is_empty() {
-        println!("\nNo messages found matching: {}", config.query);
+    // Only early-terminate during the scan when no sort is requested; otherwise we must
+    // see every match before we can sort and take the top-N.
+    let scan_limit = if config.sort == SortMode::NoSort {
+        config.limit
+    } else {
+        usize::MAX
+    };
+    let mut results = search_messages(&config.mail_root, &groups, scan_limit);
+    sort_results(&mut results, config.sort);
+    if results.len() > config.limit {
+        results.truncate(config.limit);
+    }
+
+    if config.json {
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else if results.is_empty() {
+        println!("\nNo messages found matching: {}", display_query);
     } else {
         // Run TUI
-        run_tui(results, config.query)?;
+        run_tui(results, display_query, highlight_terms, config.sort)?;
     }
 
     Ok(())

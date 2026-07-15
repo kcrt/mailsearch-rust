@@ -2,6 +2,7 @@
 
 use crate::highlight::get_highlighted_text;
 use crate::models::SearchResult;
+use crate::sort::{compare_results, parse_date_from_result, SortMode};
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use crossterm::{
@@ -30,45 +31,11 @@ enum FilterType {
     Before(NaiveDate),
 }
 
-/// Sort mode for ordering search results.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum SortMode {
-    NoSort,
-    DateAsc,
-    DateDesc,
-    Subject,
-    From,
-    To,
-}
-
-impl SortMode {
-    fn next(self) -> Self {
-        match self {
-            SortMode::NoSort => SortMode::DateAsc,
-            SortMode::DateAsc => SortMode::DateDesc,
-            SortMode::DateDesc => SortMode::Subject,
-            SortMode::Subject => SortMode::From,
-            SortMode::From => SortMode::To,
-            SortMode::To => SortMode::NoSort,
-        }
-    }
-
-    fn as_str(&self) -> &str {
-        match self {
-            SortMode::NoSort => "no sort",
-            SortMode::DateAsc => "date asc",
-            SortMode::DateDesc => "date desc",
-            SortMode::Subject => "subject",
-            SortMode::From => "from",
-            SortMode::To => "to",
-        }
-    }
-}
-
 /// TUI Application state.
 pub struct App {
     pub results: Vec<SearchResult>,
     pub query: String,
+    pub highlight_terms: Vec<String>,
     pub selected: usize,
     pub content_scroll: usize,
     pub should_quit: bool,
@@ -80,10 +47,11 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(results: Vec<SearchResult>, query: String) -> Self {
+    pub fn new(results: Vec<SearchResult>, query: String, highlight_terms: Vec<String>) -> Self {
         Self {
             results,
             query,
+            highlight_terms,
             selected: 0,
             content_scroll: 0,
             should_quit: false,
@@ -102,6 +70,12 @@ impl App {
         self.content_scroll = 0;
     }
 
+    /// Set the initial sort mode (e.g. from the `--sort` CLI flag) and apply it.
+    pub fn set_initial_sort(&mut self, mode: SortMode) {
+        self.sort_mode = mode;
+        self.apply_sort();
+    }
+
     fn apply_sort(&mut self) {
         if self.sort_mode == SortMode::NoSort {
             self.sorted_indices = None;
@@ -117,30 +91,7 @@ impl App {
 
         let mut sorted: Vec<usize> = base_indices;
         sorted.sort_by(|&a, &b| {
-            let result_a = &self.results[a];
-            let result_b = &self.results[b];
-            match self.sort_mode {
-                SortMode::NoSort => std::cmp::Ordering::Equal,
-                SortMode::DateAsc => {
-                    let date_a = parse_date_from_result(result_a);
-                    let date_b = parse_date_from_result(result_b);
-                    date_a.cmp(&date_b)
-                }
-                SortMode::DateDesc => {
-                    let date_a = parse_date_from_result(result_a);
-                    let date_b = parse_date_from_result(result_b);
-                    date_b.cmp(&date_a)
-                }
-                SortMode::Subject => {
-                    result_a.subject.to_lowercase().cmp(&result_b.subject.to_lowercase())
-                }
-                SortMode::From => {
-                    result_a.from_addr.to_lowercase().cmp(&result_b.from_addr.to_lowercase())
-                }
-                SortMode::To => {
-                    result_a.to_addr.to_lowercase().cmp(&result_b.to_addr.to_lowercase())
-                }
-            }
+            compare_results(&self.results[a], &self.results[b], self.sort_mode)
         });
 
         self.sorted_indices = Some(sorted);
@@ -459,7 +410,7 @@ fn draw_ui(f: &mut Frame, app: &App) {
         "No results".to_string()
     };
 
-    let highlighted_text = get_highlighted_text(&content, &app.query);
+    let highlighted_text = get_highlighted_text(&content, &app.highlight_terms);
 
     let content_paragraph = Paragraph::new(highlighted_text)
         .block(
@@ -536,6 +487,7 @@ fn with_terminal_suspended<R>(
         EnableMouseCapture
     ).unwrap();
     enable_raw_mode().unwrap();
+    terminal.flush().unwrap();
     result
 }
 
@@ -546,15 +498,6 @@ fn ql_command(path: &str) -> Result<()> {
         .status()
         .context("Failed to execute qlmanage")?;
     Ok(())
-}
-
-/// Extract date from SearchResult date_str.
-fn parse_date_from_result(result: &SearchResult) -> Option<NaiveDate> {
-    result
-        .date_str
-        .split_whitespace()
-        .next()
-        .and_then(|d| NaiveDate::parse_from_str(d, "%Y-%m-%d").ok())
 }
 
 /// Handle filter mode input.
@@ -615,7 +558,12 @@ fn handle_normal_mode_input(
 }
 
 /// Run the TUI application.
-pub fn run_tui(results: Vec<SearchResult>, query: String) -> Result<()> {
+pub fn run_tui(
+    results: Vec<SearchResult>,
+    query: String,
+    highlight_terms: Vec<String>,
+    initial_sort: SortMode,
+) -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
@@ -624,7 +572,8 @@ pub fn run_tui(results: Vec<SearchResult>, query: String) -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     // Create app
-    let mut app = App::new(results, query);
+    let mut app = App::new(results, query, highlight_terms);
+    app.set_initial_sort(initial_sort);
 
     // Event loop
     while !app.should_quit {
@@ -833,7 +782,7 @@ mod tests {
             },
         ];
 
-        let mut app = App::new(results, "test".to_string());
+        let mut app = App::new(results, "test".to_string(), vec!["test".to_string()]);
 
         // Apply invalid filter type (unknown:) - should result in empty filtered_indices
         app.filter_input = "unknown:filter".to_string();

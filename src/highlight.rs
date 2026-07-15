@@ -8,13 +8,8 @@ use ratatui::text::{Line, Span};
 /// Returns a vector of lines, where each line is a vector of TextParts.
 pub fn tokenize_with_highlighting<'a>(
     text: &'a str,
-    query: &str,
+    terms: &[String],
 ) -> Vec<Vec<TextPart<'a>>> {
-    let terms: Vec<String> = query
-        .split_whitespace()
-        .map(|t| t.to_ascii_lowercase())
-        .collect();
-
     if terms.is_empty() {
         return text
             .lines()
@@ -72,8 +67,8 @@ pub fn parts_to_spans<'a>(parts: &[TextPart<'a>]) -> Vec<Span<'a>> {
 
 /// Get highlighted text with search terms highlighted.
 /// Highlights exact matching substrings, works for all languages including Japanese.
-pub fn get_highlighted_text<'a>(text: &'a str, query: &str) -> Vec<Line<'a>> {
-    let tokenized = tokenize_with_highlighting(text, query);
+pub fn get_highlighted_text<'a>(text: &'a str, terms: &[String]) -> Vec<Line<'a>> {
+    let tokenized = tokenize_with_highlighting(text, terms);
 
     tokenized
         .into_iter()

@@ -115,18 +115,39 @@ fn extract_body_text(mail: &mailparse::ParsedMail<'_>, text_parts: &mut Vec<Stri
     }
 }
 
-/// Check if text matches the search query (all terms must be present).
-pub fn matches_query(text: &str, query: &str) -> bool {
+/// Parse the positional query + --or values into OR-groups of AND-terms (DNF).
+/// Outer = OR, inner = AND. Terms are lowercased; empty groups are dropped.
+pub fn parse_query_groups(query: &str, or_terms: &[String]) -> Vec<Vec<String>> {
+    std::iter::once(query)
+        .chain(or_terms.iter().map(String::as_str))
+        .map(|g| {
+            g.split_whitespace()
+                .map(|t| t.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .filter(|g: &Vec<String>| !g.is_empty())
+        .collect()
+}
+
+/// Check if text matches the search query groups.
+///
+/// Groups are OR-combined; terms within a group are AND-combined (DNF).
+/// Terms are expected to be pre-lowercased by [`parse_query_groups`].
+/// An empty group list matches everything (preserves empty-query behavior).
+pub fn matches_query(text: &str, groups: &[Vec<String>]) -> bool {
+    if groups.is_empty() {
+        return true;
+    }
     let text_lower = text.to_ascii_lowercase();
-    query
-        .split_whitespace()
-        .all(|term| text_lower.contains(&term.to_ascii_lowercase()))
+    groups
+        .iter()
+        .any(|group| group.iter().all(|term| text_lower.contains(term)))
 }
 
 /// Process a single .emlx file and return SearchResult if it matches the query.
 pub fn process_emlx_file(
     path: &std::path::Path,
-    query: &str,
+    groups: &[Vec<String>],
 ) -> Option<crate::models::SearchResult> {
     let content = std::fs::read_to_string(path).ok()?;
 
@@ -149,7 +170,7 @@ pub fn process_emlx_file(
     let text_content = extract_email_text(&mail, false);
 
     // Check if matches query
-    if !matches_query(&text_content, query) {
+    if !matches_query(&text_content, groups) {
         return None;
     }
 
@@ -184,57 +205,100 @@ mod tests {
     }
 
     // ========== matches_query tests ==========
-    
+
+    // Helper: build query groups from a single AND-group string (no --or terms).
+    fn q(query: &str) -> Vec<Vec<String>> {
+        parse_query_groups(query, &[])
+    }
+
     #[test]
     fn test_matches_query_single_term() {
-        assert!(matches_query("Hello World", "hello"));
-        assert!(matches_query("Hello World", "world"));
-        assert!(!matches_query("Hello World", "foo"));
+        assert!(matches_query("Hello World", &q("hello")));
+        assert!(matches_query("Hello World", &q("world")));
+        assert!(!matches_query("Hello World", &q("foo")));
     }
 
     #[test]
     fn test_matches_query_multiple_terms_and_logic() {
         // All terms must be present (AND logic)
-        assert!(matches_query("rust programming language", "rust language"));
-        assert!(matches_query("rust programming language", "rust programming"));
-        assert!(!matches_query("rust programming", "rust java"));
-        assert!(!matches_query("rust", "rust java"));
+        assert!(matches_query("rust programming language", &q("rust language")));
+        assert!(matches_query("rust programming language", &q("rust programming")));
+        assert!(!matches_query("rust programming", &q("rust java")));
+        assert!(!matches_query("rust", &q("rust java")));
     }
 
     #[test]
     fn test_matches_query_case_insensitive() {
-        assert!(matches_query("RuSt ProGramMinG", "rust"));
-        assert!(matches_query("rust", "RUST"));
-        assert!(matches_query("RuSt", "rUsT"));
-        assert!(matches_query("Hello WORLD", "hello world"));
+        assert!(matches_query("RuSt ProGramMinG", &q("rust")));
+        assert!(matches_query("rust", &q("RUST")));
+        assert!(matches_query("RuSt", &q("rUsT")));
+        assert!(matches_query("Hello WORLD", &q("hello world")));
     }
 
     #[test]
     fn test_matches_query_partial_word_match() {
-        assert!(matches_query("testing", "test"));
-        assert!(matches_query("programming", "program"));
-        assert!(matches_query("email@example.com", "example"));
+        assert!(matches_query("testing", &q("test")));
+        assert!(matches_query("programming", &q("program")));
+        assert!(matches_query("email@example.com", &q("example")));
     }
 
     #[test]
     fn test_matches_query_empty_cases() {
-        assert!(matches_query("any text", ""));
-        assert!(!matches_query("", "query"));
-        assert!(matches_query("", ""));
+        assert!(matches_query("any text", &q("")));
+        assert!(!matches_query("", &q("query")));
+        assert!(matches_query("", &q("")));
     }
 
     #[test]
     fn test_matches_query_special_characters() {
-        assert!(matches_query("user@example.com", "@example"));
-        assert!(matches_query("price: $100", "$100"));
-        assert!(matches_query("50% discount", "50%"));
+        assert!(matches_query("user@example.com", &q("@example")));
+        assert!(matches_query("price: $100", &q("$100")));
+        assert!(matches_query("50% discount", &q("50%")));
     }
 
     #[test]
     fn test_matches_query_whitespace_handling() {
-        assert!(matches_query("multiple   spaces", "multiple spaces"));
-        assert!(matches_query("text with\nnewlines", "text newlines"));
-        assert!(matches_query("  leading spaces", "leading"));
+        assert!(matches_query("multiple   spaces", &q("multiple spaces")));
+        assert!(matches_query("text with\nnewlines", &q("text newlines")));
+        assert!(matches_query("  leading spaces", &q("leading")));
+    }
+
+    // ========== OR search (parse_query_groups + matches_query) tests ==========
+
+    #[test]
+    fn test_parse_query_groups_dnf_structure() {
+        // Positional query becomes the first group; each --or value a further group.
+        let groups = parse_query_groups("hello world", &["today".to_string()]);
+        assert_eq!(groups, vec![vec!["hello", "world"], vec!["today"]]);
+    }
+
+    #[test]
+    fn test_parse_query_groups_drops_empty_groups() {
+        // Empty or whitespace-only --or values are ignored.
+        let groups = parse_query_groups("hello", &["".to_string(), "   ".to_string()]);
+        assert_eq!(groups, vec![vec!["hello"]]);
+        // Fully empty query yields no groups (matches everything downstream).
+        assert!(parse_query_groups("", &[]).is_empty());
+    }
+
+    #[test]
+    fn test_matches_query_or_logic() {
+        // (rust AND lang) OR (java)
+        let groups = parse_query_groups("rust lang", &["java".to_string()]);
+        assert!(matches_query("rust lang tutorial", &groups)); // first group matches
+        assert!(matches_query("java tutorial", &groups)); // second group matches
+        assert!(matches_query("rust lang and java", &groups)); // both match
+        assert!(!matches_query("python tutorial", &groups)); // neither matches
+    }
+
+    #[test]
+    fn test_matches_query_or_preserves_group_and() {
+        // A group only matches when ALL its terms are present.
+        let groups = parse_query_groups("rust lang", &["python".to_string()]);
+        // "rust" alone doesn't satisfy the (rust AND lang) group, and no python either.
+        assert!(!matches_query("rust tutorial", &groups));
+        // "python" satisfies its single-term group via OR.
+        assert!(matches_query("python tutorial", &groups));
     }
 
     // ========== strip_html_tags tests ==========
@@ -346,7 +410,7 @@ mod tests {
             return;
         }
 
-        let result = process_emlx_file(&path, "rust programming");
+        let result = process_emlx_file(&path, &q("rust programming"));
         assert!(result.is_some());
         
         let search_result = result.unwrap();
@@ -362,7 +426,7 @@ mod tests {
             return;
         }
 
-        let result = process_emlx_file(&path, "invoice receipt");
+        let result = process_emlx_file(&path, &q("invoice receipt"));
         assert!(result.is_some());
         
         let search_result = result.unwrap();
@@ -380,7 +444,7 @@ mod tests {
             return;
         }
 
-        let result = process_emlx_file(&path, "project update");
+        let result = process_emlx_file(&path, &q("project update"));
         assert!(result.is_some());
         
         let search_result = result.unwrap();
@@ -395,7 +459,7 @@ mod tests {
             return;
         }
 
-        let result = process_emlx_file(&path, "without");
+        let result = process_emlx_file(&path, &q("without"));
         assert!(result.is_some());
         
         let search_result = result.unwrap();
@@ -410,7 +474,7 @@ mod tests {
             return;
         }
 
-        let result = process_emlx_file(&path, "nonexistent query xyz");
+        let result = process_emlx_file(&path, &q("nonexistent query xyz"));
         assert!(result.is_none());
     }
 
@@ -422,7 +486,7 @@ mod tests {
         }
 
         // Should handle gracefully without panicking
-        let _result = process_emlx_file(&path, "any");
+        let _result = process_emlx_file(&path, &q("any"));
         // May return None or handle error gracefully
         // Main goal: no panic
     }
@@ -430,7 +494,7 @@ mod tests {
     #[test]
     fn test_process_emlx_file_nonexistent() {
         let path = PathBuf::from("nonexistent.emlx");
-        let result = process_emlx_file(&path, "query");
+        let result = process_emlx_file(&path, &q("query"));
         assert!(result.is_none());
     }
 
@@ -442,7 +506,7 @@ mod tests {
         }
 
         // Query in different case
-        let result = process_emlx_file(&path, "RUST PROGRAMMING");
+        let result = process_emlx_file(&path, &q("RUST PROGRAMMING"));
         assert!(result.is_some());
     }
 }
