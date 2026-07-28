@@ -27,6 +27,10 @@ pub struct SearchResult {
     /// Message date in epoch seconds, used for sorting and date filtering.
     /// `None` when neither the `Date:` header nor the file mtime could supply one.
     pub timestamp: Option<i64>,
+    /// RFC 5322 `Message-ID`, angle brackets included, as it appears in the header.
+    /// `None` when the message carries no usable one. Included so callers can
+    /// address a message (e.g. to draft a reply) without re-parsing the file.
+    pub message_id: Option<String>,
     #[serde(rename = "path")]
     pub file_path: String,
     #[serde(skip)]

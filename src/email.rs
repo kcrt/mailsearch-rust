@@ -93,12 +93,26 @@ pub fn clean_header_value(value: &str) -> String {
     value.replace(['\r', '\n'], " ")
 }
 
-/// Extract header value safely.
-pub fn extract_header(mail: &mailparse::ParsedMail<'_>, header: &str, default: &str) -> String {
+/// Raw value of a header, cleaned of embedded newlines. `None` if absent.
+fn header_value(mail: &mailparse::ParsedMail<'_>, header: &str) -> Option<String> {
     mail.headers
         .get_first_header(header)
         .map(|h| clean_header_value(&h.get_value()))
-        .unwrap_or_else(|| default.to_string())
+}
+
+/// Extract header value safely.
+pub fn extract_header(mail: &mailparse::ParsedMail<'_>, header: &str, default: &str) -> String {
+    header_value(mail, header).unwrap_or_else(|| default.to_string())
+}
+
+/// Extract the `Message-ID`, treating a blank one as absent.
+///
+/// Kept as an `Option` because an unsent draft can lack one, and a caller that
+/// wants to reply needs to tell "no id" apart from an empty string.
+pub fn extract_message_id(mail: &mailparse::ParsedMail<'_>) -> Option<String> {
+    header_value(mail, "Message-ID")
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
 }
 
 /// Extract all text content from an email message.
@@ -242,6 +256,7 @@ pub fn process_emlx_file(
     let to_addr = extract_header(&mail, "To", "");
     let cc_addr = extract_header(&mail, "Cc", "");
     let date_str = date_display(timestamp, raw_date.as_deref());
+    let message_id = extract_message_id(&mail);
 
     Some(crate::models::SearchResult {
         subject,
@@ -250,6 +265,7 @@ pub fn process_emlx_file(
         cc_addr,
         date_str,
         timestamp,
+        message_id,
         file_path: path.display().to_string(),
         content: text_content,
     })
@@ -662,6 +678,47 @@ mod tests {
     }
 
     // ========== date window tests ==========
+
+    #[test]
+    fn test_process_emlx_file_records_message_id() {
+        let path = fixture_path("plain_text.emlx");
+        if !path.exists() {
+            return;
+        }
+
+        let result = scan(&path, "rust programming").unwrap();
+        // Angle brackets are preserved, matching the header and what Python's
+        // `msg["message-id"]` returns.
+        assert_eq!(
+            result.message_id.as_deref(),
+            Some("<plain-text-fixture@example.com>")
+        );
+    }
+
+    #[test]
+    fn test_process_emlx_file_without_message_id() {
+        let path = fixture_path("no_subject.emlx");
+        if !path.exists() {
+            return;
+        }
+
+        let result = scan(&path, "without").unwrap();
+        assert_eq!(result.message_id, None);
+    }
+
+    #[test]
+    fn test_extract_message_id_treats_blank_as_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blank_id.emlx");
+        std::fs::write(
+            &path,
+            "42\nFrom: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n",
+        )
+        .unwrap();
+
+        let result = scan(&path, "body text").unwrap();
+        assert_eq!(result.message_id, None, "a blank Message-ID is not usable");
+    }
 
     #[test]
     fn test_process_emlx_file_records_timestamp() {

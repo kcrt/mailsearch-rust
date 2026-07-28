@@ -627,6 +627,7 @@ mod tests {
             cc_addr: String::new(),
             date_str: crate::email::format_timestamp(timestamp).unwrap(),
             timestamp: Some(timestamp),
+            message_id: Some("<sample@example.com>".to_string()),
             file_path: "/path".to_string(),
             content: "Content".to_string(),
         }

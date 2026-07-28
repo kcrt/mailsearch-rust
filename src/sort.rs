@@ -107,6 +107,7 @@ mod tests {
                 .and_then(crate::email::format_timestamp)
                 .unwrap_or_else(|| "N/A".to_string()),
             timestamp,
+            message_id: None,
             file_path: String::new(),
             content: String::new(),
         }

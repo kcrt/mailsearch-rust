@@ -16,7 +16,7 @@ A fast full-text search tool for Apple Mail `.emlx` files with an interactive te
 - **macOS integration** - QuickLook preview and open emails with default system applications
 - **Performance optimized** - Parallel processing for unlimited searches, sequential with early termination for limited results
 - **Smart email parsing** - Handles both plain text and HTML emails, strips HTML/CSS/JavaScript, preserves embedded newlines
-- **Comprehensive metadata** - Displays From, To, Cc, Subject, and Date for each email
+- **Comprehensive metadata** - Displays From, To, Cc, Subject, and Date for each email; `--json` also emits `message_id` and a `timestamp`, so downstream tools can address a message without re-parsing the file
 
 ## Installation
 
@@ -50,7 +50,7 @@ mailsearch [OPTIONS] <QUERY>
 - `--this-week` - Only search mail from the last 7 days. Shorthand for `--days 7`. See [Date windows](#date-windows).
 - `--days <N>` - Only search mail from the last N days (max 36500). `--days 0` means today only. Cannot be combined with `--this-week`.
 - `--sort <ORDER>` - Sort results before display/output. One of `none` (default), `date-asc`, `date-desc`, `subject`, `from`, `to`. When combined with `--limit`, results are sorted first and then truncated (i.e. the top-N).
-- `--json` - Print results to stdout as a JSON array instead of launching the TUI. Each entry contains `subject`, `from`, `to`, `cc`, `date`, `timestamp` (Unix epoch seconds, `null` if the date could not be determined), and `path` (the message body is omitted).
+- `--json` - Print results to stdout as a JSON array instead of launching the TUI. Each entry contains `subject`, `from`, `to`, `cc`, `date`, `timestamp` (Unix epoch seconds, `null` if the date could not be determined), `message_id` (angle brackets included, `null` if the message has none — e.g. an unsent draft), and `path`. The message body is omitted.
 
 ### Examples
 
