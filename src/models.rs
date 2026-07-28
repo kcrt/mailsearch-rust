@@ -24,6 +24,9 @@ pub struct SearchResult {
     pub cc_addr: String,
     #[serde(rename = "date")]
     pub date_str: String,
+    /// Message date in epoch seconds, used for sorting and date filtering.
+    /// `None` when neither the `Date:` header nor the file mtime could supply one.
+    pub timestamp: Option<i64>,
     #[serde(rename = "path")]
     pub file_path: String,
     #[serde(skip)]

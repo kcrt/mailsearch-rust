@@ -2,7 +2,7 @@
 
 use crate::highlight::get_highlighted_text;
 use crate::models::SearchResult;
-use crate::sort::{compare_results, parse_date_from_result, SortMode};
+use crate::sort::{compare_results, result_date, SortMode};
 use anyhow::{Context, Result};
 use chrono::NaiveDate;
 use crossterm::{
@@ -25,6 +25,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 enum FilterType {
     From(String),
+    To(String),
     Subject(String),
     All(String), // Search across all fields (from, subject, content)
     After(NaiveDate),
@@ -262,6 +263,7 @@ fn parse_single_filter(token: &str) -> Option<FilterType> {
     if let Some((filter_type, value)) = token.split_once(':') {
         match filter_type.to_lowercase().as_str() {
             "from" => Some(FilterType::From(value.to_string())),
+            "to" => Some(FilterType::To(value.to_string())),
             "subject" => Some(FilterType::Subject(value.to_string())),
             "after" => NaiveDate::parse_from_str(value, "%Y-%m-%d")
                 .ok()
@@ -286,6 +288,10 @@ fn match_filter(filter: &FilterType, result: &SearchResult) -> bool {
             .from_addr
             .to_lowercase()
             .contains(&pattern.to_lowercase()),
+        FilterType::To(pattern) => result
+            .to_addr
+            .to_lowercase()
+            .contains(&pattern.to_lowercase()),
         FilterType::Subject(pattern) => result
             .subject
             .to_lowercase()
@@ -296,16 +302,8 @@ fn match_filter(filter: &FilterType, result: &SearchResult) -> bool {
                 || result.subject.to_lowercase().contains(&pattern_lower)
                 || result.content.to_lowercase().contains(&pattern_lower)
         }
-        FilterType::After(date) => {
-            parse_date_from_result(result)
-                .map(|result_date| result_date >= *date)
-                .unwrap_or(false)
-        }
-        FilterType::Before(date) => {
-            parse_date_from_result(result)
-                .map(|result_date| result_date <= *date)
-                .unwrap_or(false)
-        }
+        FilterType::After(date) => result_date(result).is_some_and(|d| d >= *date),
+        FilterType::Before(date) => result_date(result).is_some_and(|d| d <= *date),
     }
 }
 
@@ -609,6 +607,31 @@ pub fn run_tui(
 mod tests {
     use super::*;
 
+    /// Epoch seconds for 2025-01-15 10:00 UTC, the date every sample result carries.
+    fn sample_timestamp() -> i64 {
+        chrono::DateTime::parse_from_rfc3339("2025-01-15T10:00:00Z")
+            .unwrap()
+            .timestamp()
+    }
+
+    /// A result with inert fields; tests override only what they assert on.
+    ///
+    /// `date_str` is derived from `timestamp` rather than hardcoded, so it stays
+    /// consistent with what `after:`/`before:` compare against.
+    fn sample_result() -> SearchResult {
+        let timestamp = sample_timestamp();
+        SearchResult {
+            subject: "Test".to_string(),
+            from_addr: "sender@example.com".to_string(),
+            to_addr: String::new(),
+            cc_addr: String::new(),
+            date_str: crate::email::format_timestamp(timestamp).unwrap(),
+            timestamp: Some(timestamp),
+            file_path: "/path".to_string(),
+            content: "Content".to_string(),
+        }
+    }
+
     #[test]
     fn test_parse_filter_from() {
         let filters = parse_filter("from:john");
@@ -667,15 +690,8 @@ mod tests {
 
     #[test]
     fn test_match_filter_from() {
-        let result = SearchResult {
-            subject: "Test".to_string(),
-            from_addr: "John Doe <john@example.com>".to_string(),
-            to_addr: "".to_string(),
-            cc_addr: "".to_string(),
-            date_str: "2025-01-15 10:00".to_string(),
-            file_path: "/path".to_string(),
-            content: "Content".to_string(),
-        };
+        let mut result = sample_result();
+        result.from_addr = "John Doe <john@example.com>".to_string();
 
         let filter = FilterType::From("john".to_string());
         assert!(match_filter(&filter, &result));
@@ -685,16 +701,37 @@ mod tests {
     }
 
     #[test]
+    fn test_match_filter_to() {
+        let mut result = sample_result();
+        result.to_addr = "Bob <bob@example.com>".to_string();
+
+        let filter = FilterType::To("bob@example.com".to_string());
+        assert!(match_filter(&filter, &result));
+
+        // Case insensitive, like the other text filters.
+        let filter = FilterType::To("BOB".to_string());
+        assert!(match_filter(&filter, &result));
+
+        let filter = FilterType::To("carol".to_string());
+        assert!(!match_filter(&filter, &result));
+    }
+
+    #[test]
+    fn test_parse_filter_to() {
+        // Documented in the README but previously unparsed, which silently emptied
+        // the whole result list.
+        let filters = parse_filter("to:bob@example.com");
+        assert_eq!(filters.len(), 1);
+        match &filters[0] {
+            FilterType::To(value) => assert_eq!(value, "bob@example.com"),
+            _ => panic!("Expected To filter"),
+        }
+    }
+
+    #[test]
     fn test_match_filter_subject() {
-        let result = SearchResult {
-            subject: "Project Update Meeting".to_string(),
-            from_addr: "sender@example.com".to_string(),
-            to_addr: "".to_string(),
-            cc_addr: "".to_string(),
-            date_str: "2025-01-15 10:00".to_string(),
-            file_path: "/path".to_string(),
-            content: "Content".to_string(),
-        };
+        let mut result = sample_result();
+        result.subject = "Project Update Meeting".to_string();
 
         let filter = FilterType::Subject("project".to_string());
         assert!(match_filter(&filter, &result));
@@ -705,17 +742,14 @@ mod tests {
 
     #[test]
     fn test_match_filter_after() {
-        let result = SearchResult {
-            subject: "Test".to_string(),
-            from_addr: "sender@example.com".to_string(),
-            to_addr: "".to_string(),
-            cc_addr: "".to_string(),
-            date_str: "2025-01-15 10:00".to_string(),
-            file_path: "/path".to_string(),
-            content: "Content".to_string(),
-        };
+        let result = sample_result();
+        assert_eq!(result.date_str, "2025-01-15 10:00");
 
         let filter = FilterType::After(NaiveDate::from_ymd_opt(2025, 1, 10).unwrap());
+        assert!(match_filter(&filter, &result));
+
+        // Inclusive on the message's own date.
+        let filter = FilterType::After(NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
         assert!(match_filter(&filter, &result));
 
         let filter = FilterType::After(NaiveDate::from_ymd_opt(2025, 1, 20).unwrap());
@@ -724,20 +758,27 @@ mod tests {
 
     #[test]
     fn test_match_filter_before() {
-        let result = SearchResult {
-            subject: "Test".to_string(),
-            from_addr: "sender@example.com".to_string(),
-            to_addr: "".to_string(),
-            cc_addr: "".to_string(),
-            date_str: "2025-01-15 10:00".to_string(),
-            file_path: "/path".to_string(),
-            content: "Content".to_string(),
-        };
+        let result = sample_result();
 
         let filter = FilterType::Before(NaiveDate::from_ymd_opt(2025, 1, 20).unwrap());
         assert!(match_filter(&filter, &result));
 
+        let filter = FilterType::Before(NaiveDate::from_ymd_opt(2025, 1, 15).unwrap());
+        assert!(match_filter(&filter, &result));
+
         let filter = FilterType::Before(NaiveDate::from_ymd_opt(2025, 1, 10).unwrap());
+        assert!(!match_filter(&filter, &result));
+    }
+
+    #[test]
+    fn test_match_filter_dates_exclude_undated_results() {
+        let mut result = sample_result();
+        result.timestamp = None;
+
+        let filter = FilterType::After(NaiveDate::from_ymd_opt(2020, 1, 1).unwrap());
+        assert!(!match_filter(&filter, &result));
+
+        let filter = FilterType::Before(NaiveDate::from_ymd_opt(2030, 1, 1).unwrap());
         assert!(!match_filter(&filter, &result));
     }
 
@@ -770,17 +811,11 @@ mod tests {
 
     #[test]
     fn test_apply_filter_with_invalid_input() {
-        let results = vec![
-            SearchResult {
-                subject: "Test Subject".to_string(),
-                from_addr: "john@example.com".to_string(),
-                to_addr: "".to_string(),
-                cc_addr: "".to_string(),
-                date_str: "2025-01-15 10:00".to_string(),
-                file_path: "/path1".to_string(),
-                content: "Content".to_string(),
-            },
-        ];
+        let results = vec![SearchResult {
+            subject: "Test Subject".to_string(),
+            from_addr: "john@example.com".to_string(),
+            ..sample_result()
+        }];
 
         let mut app = App::new(results, "test".to_string(), vec!["test".to_string()]);
 
@@ -819,11 +854,8 @@ mod tests {
         let result = SearchResult {
             subject: "Project Update Meeting".to_string(),
             from_addr: "john@example.com".to_string(),
-            to_addr: "".to_string(),
-            cc_addr: "".to_string(),
-            date_str: "2025-01-15 10:00".to_string(),
-            file_path: "/path".to_string(),
             content: "The project is progressing well with updates".to_string(),
+            ..sample_result()
         };
 
         // Match in subject

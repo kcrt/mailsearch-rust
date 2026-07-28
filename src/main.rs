@@ -13,6 +13,7 @@ mod highlight;
 mod models;
 mod search;
 mod sort;
+mod timewindow;
 mod tui;
 
 use anyhow::{Context, Result};
@@ -73,21 +74,48 @@ fn main() -> Result<()> {
         format!("{} OR {}", config.query, config.or_terms.join(" OR "))
     };
 
+    // Restrict the scan to a date window when asked. This is both a filter and the
+    // main speedup: most files can be skipped without being read.
+    let days = config.days_window();
+    let window = days.map(timewindow::window_now);
+
     // Status messages would corrupt stdout in JSON mode; suppress them there.
     if !config.json {
         println!("Searching Mail files...");
         println!("   Directory: {}", config.mail_root.display());
-        println!("   Query: {}\n", display_query);
+        println!("   Query: {}", display_query);
+        if let (Some(days), Some(window)) = (days, window) {
+            // Dates are displayed in UTC throughout, so name the zone here: this
+            // is the one line a reader would compare against their wall clock.
+            println!(
+                "   Period: last {} day{} (since {} UTC)",
+                days,
+                if days == 1 { "" } else { "s" },
+                email::format_timestamp(window.date_cutoff)
+                    .unwrap_or_else(|| "unknown".to_string())
+            );
+        }
+        println!();
     }
 
     // Only early-terminate during the scan when no sort is requested; otherwise we must
-    // see every match before we can sort and take the top-N.
-    let scan_limit = if config.sort == SortMode::NoSort {
+    // see every match before we can sort and take the top-N. A date window already cuts
+    // the candidate set down to very little, so keep the parallel path in that case
+    // rather than dropping to the sequential scan for an arbitrary top-N.
+    let scan_limit = if config.sort == SortMode::NoSort && window.is_none() {
         config.limit
     } else {
         usize::MAX
     };
-    let mut results = search_messages(&config.mail_root, &groups, scan_limit);
+    let outcome = search_messages(&config.mail_root, &groups, scan_limit, window);
+    if outcome.total_seen == 0 {
+        eprintln!("\nError: No .emlx files found in the Mail directory.");
+        eprintln!("\nPlease ensure that the Mail directory is correct and accessible from this tool.");
+        eprintln!("\n    Directory: {}", config.mail_root.display());
+        std::process::exit(1);
+    }
+
+    let mut results = outcome.results;
     sort_results(&mut results, config.sort);
     if results.len() > config.limit {
         results.truncate(config.limit);
@@ -96,7 +124,17 @@ fn main() -> Result<()> {
     if config.json {
         println!("{}", serde_json::to_string_pretty(&results)?);
     } else if results.is_empty() {
-        println!("\nNo messages found matching: {}", display_query);
+        // Name the window explicitly, so an empty result set doesn't read as
+        // "the query matched nothing" when it was the date restriction.
+        match days {
+            Some(days) => println!(
+                "\nNo messages from the last {} day{} matching: {}",
+                days,
+                if days == 1 { "" } else { "s" },
+                display_query
+            ),
+            None => println!("\nNo messages found matching: {}", display_query),
+        }
     } else {
         // Run TUI
         run_tui(results, display_query, highlight_terms, config.sort)?;
