@@ -115,26 +115,29 @@ pub fn extract_message_id(mail: &mailparse::ParsedMail<'_>) -> Option<String> {
         .filter(|v| !v.is_empty())
 }
 
-/// Extract all text content from an email message.
-pub fn extract_email_text(mail: &mailparse::ParsedMail<'_>, include_headers: bool) -> String {
+/// Headers that a query is matched against, alongside the body.
+///
+/// `Reply-To` is here because it often carries an address the visible `From`
+/// does not, and searching for a correspondent should find those messages too.
+const SEARCHABLE_HEADERS: [&str; 5] = ["Subject", "From", "To", "Cc", "Reply-To"];
+
+/// The searchable headers rendered as `"Subject: …\nFrom: …"`, MIME-decoded.
+///
+/// Kept apart from the body so a caller can search both while still displaying
+/// only the body (see [`process_emlx_file`]).
+pub fn extract_header_text(mail: &mailparse::ParsedMail<'_>) -> String {
+    SEARCHABLE_HEADERS
+        .iter()
+        .filter_map(|header| header_value(mail, header).map(|value| format!("{header}: {value}")))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Extract the readable body of a message: every text part, HTML stripped,
+/// attachments skipped. Headers are [`extract_header_text`]'s job.
+pub fn extract_email_text(mail: &mailparse::ParsedMail<'_>) -> String {
     let mut text_parts = Vec::new();
-
-    // Extract headers if requested
-    if include_headers {
-        let headers = ["Subject", "From", "To", "Cc", "Reply-To"];
-        for header in headers {
-            if let Some(value) = mail.headers.get_first_header(header) {
-                let cleaned = clean_header_value(&value.get_value());
-                text_parts.push(format!("{}: {}", header, cleaned));
-            }
-        }
-        // Add blank line separator between headers and body
-        text_parts.push(String::new());
-    }
-
-    // Extract body content
     extract_body_text(mail, &mut text_parts);
-
     text_parts.join("\n")
 }
 
@@ -179,19 +182,27 @@ pub fn parse_query_groups(query: &str, or_terms: &[String]) -> Vec<Vec<String>> 
         .collect()
 }
 
-/// Check if text matches the search query groups.
+/// Check if a message, given as the pieces of text it is made of, matches the
+/// search query groups.
 ///
 /// Groups are OR-combined; terms within a group are AND-combined (DNF).
 /// Terms are expected to be pre-lowercased by [`parse_query_groups`].
 /// An empty group list matches everything (preserves empty-query behavior).
-pub fn matches_query(text: &str, groups: &[Vec<String>]) -> bool {
+///
+/// A term is satisfied when *any* part contains it, so an AND-group can be spread
+/// across the pieces — `mailsearch grafana raid` matches a message whose header
+/// holds one term and whose body holds the other. Taking the parts separately
+/// avoids concatenating the body into a fresh allocation for every message.
+pub fn matches_query_parts(parts: &[&str], groups: &[Vec<String>]) -> bool {
     if groups.is_empty() {
         return true;
     }
-    let text_lower = text.to_ascii_lowercase();
-    groups
-        .iter()
-        .any(|group| group.iter().all(|term| text_lower.contains(term)))
+    let lowered: Vec<String> = parts.iter().map(|p| p.to_ascii_lowercase()).collect();
+    groups.iter().any(|group| {
+        group
+            .iter()
+            .all(|term| lowered.iter().any(|part| part.contains(term)))
+    })
 }
 
 /// What a message must satisfy to be returned by the scan.
@@ -243,11 +254,13 @@ pub fn process_emlx_file(
         }
     }
 
-    // Extract text content (without headers, since they're displayed separately in UI)
-    let text_content = extract_email_text(&mail, false);
+    // The body is kept header-free because the UI shows the headers separately,
+    // but the query is matched against both: a sender, recipient or subject that
+    // never appears in the body must still be findable.
+    let text_content = extract_email_text(&mail);
+    let header_content = extract_header_text(&mail);
 
-    // Check if matches query
-    if !matches_query(&text_content, criteria.groups) {
+    if !matches_query_parts(&[&header_content, &text_content], criteria.groups) {
         return None;
     }
 
@@ -289,6 +302,11 @@ mod tests {
     // Helper: build query groups from a single AND-group string (no --or terms).
     fn q(query: &str) -> Vec<Vec<String>> {
         parse_query_groups(query, &[])
+    }
+
+    // Helper: the one-part case, which is what most of these tests are about.
+    fn matches_query(text: &str, groups: &[Vec<String>]) -> bool {
+        matches_query_parts(&[text], groups)
     }
 
     // Helpers: run a scan against a file. `Criteria` borrows the groups, so these
@@ -643,6 +661,63 @@ mod tests {
 
         let result = scan(&path, "nonexistent query xyz");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn a_sender_only_in_the_headers_is_searchable() {
+        // The regression this guards: the body was searched but the headers were
+        // not, so a message could only be found by words it happened to repeat in
+        // its text. An address that appears solely in `From:` must match.
+        let path = fixture_path("plain_text.emlx");
+        if !path.exists() {
+            return;
+        }
+
+        let body = {
+            let bytes = std::fs::read(&path).unwrap();
+            let start = bytes.iter().position(|&b| b == b'\n').unwrap() + 1;
+            let mail = mailparse::parse_mail(&bytes[start..]).unwrap();
+            extract_email_text(&mail)
+        };
+        assert!(
+            !body.to_lowercase().contains("sender@example.com"),
+            "fixture must not repeat the sender in its body, or this proves nothing"
+        );
+
+        assert!(scan(&path, "sender@example.com").is_some(), "From");
+        assert!(scan(&path, "recipient@example.com").is_some(), "To");
+        assert!(scan(&path, "Test Plain Text Email").is_some(), "Subject");
+    }
+
+    #[test]
+    fn an_and_group_may_span_the_headers_and_the_body() {
+        // Terms are matched per-part, so this only works if a group is allowed to
+        // draw one term from the headers and another from the body.
+        let path = fixture_path("plain_text.emlx");
+        if !path.exists() {
+            return;
+        }
+
+        assert!(scan(&path, "sender@example.com plain text").is_some());
+        assert!(scan(&path, "sender@example.com nonexistentxyz").is_none());
+    }
+
+    #[test]
+    fn matches_query_parts_spreads_an_and_group_across_parts() {
+        assert!(matches_query_parts(
+            &["From: alice@example.com", "the body text"],
+            &q("alice body")
+        ));
+        assert!(!matches_query_parts(
+            &["From: alice@example.com", "the body text"],
+            &q("alice missing")
+        ));
+        // OR-groups still work across parts.
+        let groups = parse_query_groups("nothing", &["alice".to_string()]);
+        assert!(matches_query_parts(
+            &["From: alice@example.com", "the body text"],
+            &groups
+        ));
     }
 
     #[test]

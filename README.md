@@ -42,6 +42,8 @@ mailsearch [OPTIONS] <QUERY>
 
 - `<QUERY>` - Search terms (space-separated, AND logic applied). Combine with `--or` for OR search (see below).
 
+  Terms are matched against the `Subject`, `From`, `To`, `Cc` and `Reply-To` headers as well as the body, so an address that never appears in the text is still findable (`mailsearch noreply@example.com`). A single AND-group may take one term from a header and another from the body.
+
 ### Options
 
 - `-o, --or <TERMS>` - Add an OR group (repeatable). Each group is AND-matched internally, and groups are OR-combined. The whole search still runs in a single scan. See [OR search](#or-search).
