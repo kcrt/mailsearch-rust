@@ -64,14 +64,15 @@ fn main() -> Result<()> {
     }
 
     // Build OR-groups (outer = OR, inner = AND terms) once, then reuse across the scan.
-    let groups = email::parse_query_groups(&config.query, &config.or_terms);
+    let query = config.query_string();
+    let groups = email::parse_query_groups(&query, &config.or_terms);
     // Flattened, pre-lowercased term list for highlighting any matched term.
     let highlight_terms: Vec<String> = groups.iter().flatten().cloned().collect();
     // Human-readable query used for status messages and the TUI header.
     let display_query = if config.or_terms.is_empty() {
-        config.query.clone()
+        query.clone()
     } else {
-        format!("{} OR {}", config.query, config.or_terms.join(" OR "))
+        format!("{} OR {}", query, config.or_terms.join(" OR "))
     };
 
     // Restrict the scan to a date window when asked. This is both a filter and the

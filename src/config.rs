@@ -10,7 +10,13 @@ use std::path::PathBuf;
 #[command(author, version, about, long_about = None)]
 pub struct Config {
     /// Search query (multiple words = AND search; use --or for OR groups)
-    pub query: String,
+    // Taken as a list so the words may be quoted as one argument or left bare:
+    // `mailsearch "オボムコイド 鶏卵"` and `mailsearch オボムコイド 鶏卵` mean the
+    // same AND search. A single `String` rejected the unquoted form with
+    // "unexpected argument", which reads like a failed search rather than a
+    // usage error once stderr is discarded.
+    #[arg(required = true, num_args = 1.., value_name = "QUERY")]
+    pub query: Vec<String>,
 
     /// Additional OR group(s); repeatable. Each value is AND-matched internally,
     /// groups are OR-combined. e.g. `--or "foo bar" --or baz`
@@ -56,6 +62,14 @@ pub struct Config {
 const MAX_DAYS: i64 = 36_500;
 
 impl Config {
+    /// The query words as a single whitespace-separated string.
+    ///
+    /// Query parsing splits on whitespace anyway, so joining here keeps quoted
+    /// and unquoted invocations indistinguishable downstream.
+    pub fn query_string(&self) -> String {
+        self.query.join(" ")
+    }
+
     /// Number of days to restrict the search to, if a date window was requested.
     pub fn days_window(&self) -> Option<u32> {
         self.days.or_else(|| self.this_week.then_some(7))
@@ -68,6 +82,29 @@ mod tests {
 
     fn parse(args: &[&str]) -> Config {
         Config::try_parse_from(std::iter::once("mailsearch").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn bare_words_are_one_and_query() {
+        // The unquoted form used to be rejected outright.
+        assert_eq!(parse(&["オボムコイド", "鶏卵"]).query_string(), "オボムコイド 鶏卵");
+    }
+
+    #[test]
+    fn a_quoted_query_is_unchanged() {
+        assert_eq!(parse(&["オボムコイド 鶏卵"]).query_string(), "オボムコイド 鶏卵");
+    }
+
+    #[test]
+    fn bare_words_still_take_flags_after_them() {
+        let config = parse(&["hello", "world", "--days", "30"]);
+        assert_eq!(config.query_string(), "hello world");
+        assert_eq!(config.days_window(), Some(30));
+    }
+
+    #[test]
+    fn an_empty_query_is_rejected() {
+        assert!(Config::try_parse_from(["mailsearch"]).is_err());
     }
 
     #[test]

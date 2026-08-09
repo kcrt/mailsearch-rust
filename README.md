@@ -42,6 +42,8 @@ mailsearch [OPTIONS] <QUERY>
 
 - `<QUERY>` - Search terms (space-separated, AND logic applied). Combine with `--or` for OR search (see below).
 
+  Quoting is optional: `mailsearch hello world` and `mailsearch "hello world"` are the same AND search. Put `--` first if a term itself starts with `-`, so it is not read as a flag.
+
   Terms are matched against the `Subject`, `From`, `To`, `Cc` and `Reply-To` headers as well as the body, so an address that never appears in the text is still findable (`mailsearch noreply@example.com`). A single AND-group may take one term from a header and another from the body.
 
 ### Options
