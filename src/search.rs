@@ -1,10 +1,12 @@
 //! Search functionality for finding and processing email files.
 
 use crate::email::{process_emlx_file, Criteria};
+use crate::models::Filters;
 use crate::models::SearchResult;
 use crate::timewindow::Window;
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressIterator, ProgressStyle};
 use rayon::prelude::*;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 use walkdir::WalkDir;
@@ -98,6 +100,64 @@ pub fn find_emlx_files(mail_root: &Path, window: Option<Window>) -> FileScan {
     FileScan { files, total_seen }
 }
 
+/// Collects results while collapsing copies of the same message.
+///
+/// Apple Mail keeps more than one `.emlx` for the same message: adjacent
+/// sequence numbers in one mailbox, plus a stale file left behind when a message
+/// is moved (INBOX → Archive). A scan therefore sees the same mail two or three
+/// times — measured on real mail, 11 messages with attachments came back as 22
+/// rows — and every caller of `--json` had to collapse them again by
+/// `message_id`. Doing it here means no caller has to.
+///
+/// Messages with no `Message-ID` are never merged: without an identity there is
+/// nothing to merge them by, and an unsent draft is a legitimate result.
+#[derive(Default)]
+struct Deduped {
+    results: Vec<SearchResult>,
+    /// `Message-ID` → index into `results`.
+    by_message_id: HashMap<String, usize>,
+}
+
+impl Deduped {
+    /// Whether `candidate` is a better copy to keep than `current`.
+    ///
+    /// A fully downloaded file beats a `.partial.emlx`: the `path` is what a
+    /// caller feeds to a tool that reads the message, and a complete file can be
+    /// read straight from disk without asking Apple Mail for the body. Beyond
+    /// that the first copy seen wins, so the order stays stable.
+    fn is_better(candidate: &SearchResult, current: &SearchResult) -> bool {
+        let partial = |result: &SearchResult| result.file_path.ends_with(".partial.emlx");
+        partial(current) && !partial(candidate)
+    }
+
+    fn push(&mut self, result: SearchResult) {
+        let Some(message_id) = result.message_id.clone() else {
+            self.results.push(result);
+            return;
+        };
+        match self.by_message_id.get(&message_id) {
+            Some(&index) => {
+                if Self::is_better(&result, &self.results[index]) {
+                    self.results[index] = result;
+                }
+            }
+            None => {
+                self.by_message_id.insert(message_id, self.results.len());
+                self.results.push(result);
+            }
+        }
+    }
+
+    /// How many distinct messages have been collected so far.
+    fn len(&self) -> usize {
+        self.results.len()
+    }
+
+    fn into_results(self) -> Vec<SearchResult> {
+        self.results
+    }
+}
+
 /// Matching messages, plus enough context to explain an empty result set.
 pub struct SearchOutcome {
     pub results: Vec<SearchResult>,
@@ -109,6 +169,7 @@ pub struct SearchOutcome {
 pub fn search_messages(
     mail_root: &Path,
     groups: &[Vec<String>],
+    filters: &Filters,
     limit: usize,
     window: Option<Window>,
 ) -> SearchOutcome {
@@ -116,6 +177,7 @@ pub fn search_messages(
     let criteria = Criteria {
         groups,
         date_cutoff: window.map(|w| w.date_cutoff),
+        filters,
     };
 
     let pb = ProgressBar::new(scan.files.len() as u64);
@@ -126,22 +188,32 @@ pub fn search_messages(
             .progress_chars("##-"),
     );
 
-    let results = if limit < usize::MAX {
-        // Use sequential iteration with early termination when limit is set
-        scan.files
-            .into_iter()
-            .progress_with(pb)
-            .filter_map(|(path, mtime)| process_emlx_file(&path, mtime, &criteria))
-            .take(limit)
-            .collect()
+    let mut deduped = Deduped::default();
+    if limit < usize::MAX {
+        // Sequential with early termination when a limit is set. The limit counts
+        // distinct messages, not files, so duplicates cannot eat into it.
+        for (path, mtime) in scan.files.into_iter().progress_with(pb) {
+            if let Some(result) = process_emlx_file(&path, mtime, &criteria) {
+                deduped.push(result);
+                if deduped.len() >= limit {
+                    break;
+                }
+            }
+        }
     } else {
-        // Use parallel iteration for unlimited search
-        scan.files
+        // Parallel for an unlimited search, then collapse duplicates in walk
+        // order. Collecting first keeps the scan itself lock-free.
+        let found: Vec<SearchResult> = scan
+            .files
             .into_par_iter()
             .progress_with(pb)
             .filter_map(|(path, mtime)| process_emlx_file(&path, mtime, &criteria))
-            .collect()
-    };
+            .collect();
+        for result in found {
+            deduped.push(result);
+        }
+    }
+    let results = deduped.into_results();
 
     SearchOutcome {
         results,
@@ -162,6 +234,82 @@ mod tests {
         let file = File::options().write(true).open(&path).unwrap();
         file.set_modified(UNIX_EPOCH + Duration::from_secs(epoch as u64))
             .unwrap();
+    }
+
+    /// Create an `.emlx`-shaped file carrying `message_id`, for dedupe tests.
+    fn write_message(dir: &Path, name: &str, message_id: &str) {
+        let raw = format!("42\nSubject: test\nMessage-ID: <{message_id}>\n\nbody\n");
+        std::fs::write(dir.join(name), raw).unwrap();
+    }
+
+    /// Scan for the fixture messages above, with no window and no filters.
+    fn scan_all(dir: &Path, limit: usize) -> SearchOutcome {
+        let groups = crate::email::parse_query_groups("test", &[]);
+        search_messages(dir, &groups, &Filters::default(), limit, None)
+    }
+
+    #[test]
+    fn copies_of_one_message_collapse_to_one_result() {
+        // Apple Mail really does keep several .emlx for one message.
+        let dir = tempfile::tempdir().unwrap();
+        write_message(dir.path(), "1.emlx", "same@example.com");
+        write_message(dir.path(), "2.emlx", "same@example.com");
+
+        let outcome = scan_all(dir.path(), usize::MAX);
+        assert_eq!(outcome.results.len(), 1);
+        // Both files were still scanned; only the results collapsed.
+        assert_eq!(outcome.total_seen, 2);
+    }
+
+    #[test]
+    fn a_complete_copy_is_preferred_over_a_partial_one() {
+        let dir = tempfile::tempdir().unwrap();
+        write_message(dir.path(), "1.partial.emlx", "same@example.com");
+        write_message(dir.path(), "2.emlx", "same@example.com");
+
+        let outcome = scan_all(dir.path(), usize::MAX);
+        assert_eq!(outcome.results.len(), 1);
+        // Asserted as a property rather than a filename, since the walk order of
+        // the two files is not guaranteed.
+        assert!(!outcome.results[0].file_path.ends_with(".partial.emlx"));
+    }
+
+    #[test]
+    fn distinct_messages_are_not_collapsed() {
+        let dir = tempfile::tempdir().unwrap();
+        write_message(dir.path(), "1.emlx", "a@example.com");
+        write_message(dir.path(), "2.emlx", "b@example.com");
+
+        assert_eq!(scan_all(dir.path(), usize::MAX).results.len(), 2);
+    }
+
+    #[test]
+    fn messages_without_a_message_id_are_kept_apart() {
+        // No identity to merge by, and an unsent draft is a real result.
+        let dir = tempfile::tempdir().unwrap();
+        write_file(dir.path(), "1.emlx", 1_000_000);
+        write_file(dir.path(), "2.emlx", 2_000_000);
+
+        assert_eq!(scan_all(dir.path(), usize::MAX).results.len(), 2);
+    }
+
+    #[test]
+    fn a_limit_counts_distinct_messages_not_files() {
+        // Two messages, two copies each: --limit 2 must still yield both.
+        let dir = tempfile::tempdir().unwrap();
+        write_message(dir.path(), "1.emlx", "a@example.com");
+        write_message(dir.path(), "2.emlx", "a@example.com");
+        write_message(dir.path(), "3.emlx", "b@example.com");
+        write_message(dir.path(), "4.emlx", "b@example.com");
+
+        let results = scan_all(dir.path(), 2).results;
+        assert_eq!(results.len(), 2);
+        let mut ids: Vec<&str> = results
+            .iter()
+            .map(|r| r.message_id.as_deref().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["<a@example.com>", "<b@example.com>"]);
     }
 
     fn window_at(cutoff: i64) -> Window {
@@ -286,7 +434,7 @@ mod tests {
 
         // No window: found.
         assert_eq!(
-            search_messages(dir.path(), &groups, usize::MAX, None)
+            search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, None)
                 .results
                 .len(),
             1
@@ -298,7 +446,7 @@ mod tests {
             mtime_cutoff: 1_700_000_000,
         };
         assert_eq!(
-            search_messages(dir.path(), &groups, usize::MAX, Some(covering))
+            search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, Some(covering))
                 .results
                 .len(),
             1
@@ -310,14 +458,14 @@ mod tests {
             date_cutoff: 1_775_000_000, // 2026-03-31
             mtime_cutoff: 1_700_000_000,
         };
-        let scan = search_messages(dir.path(), &groups, usize::MAX, Some(date_only));
+        let scan = search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, Some(date_only));
         assert!(scan.results.is_empty());
         assert_eq!(scan.total_seen, 1);
 
         // A non-matching query is still a non-match inside the window.
         let other = crate::email::parse_query_groups("unrelated", &[]);
         assert!(
-            search_messages(dir.path(), &other, usize::MAX, Some(covering))
+            search_messages(dir.path(), &other, &Filters::default(), usize::MAX, Some(covering))
                 .results
                 .is_empty()
         );

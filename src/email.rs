@@ -205,6 +205,74 @@ pub fn matches_query_parts(parts: &[&str], groups: &[Vec<String>]) -> bool {
     })
 }
 
+/// Whether a message's `From` header matches any of the given patterns.
+///
+/// Patterns are expected pre-lowercased. Matching is a substring test against
+/// the MIME-decoded header, so both the display name and the address are
+/// searchable (`--from 山田` and `--from yamada8010` both work).
+/// No patterns means no sender restriction.
+pub fn matches_from(mail: &mailparse::ParsedMail<'_>, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let Some(from) = header_value(mail, "From") else {
+        return false;
+    };
+    let from = from.to_ascii_lowercase();
+    patterns.iter().any(|pattern| from.contains(pattern))
+}
+
+/// Whether a single part counts as a real attachment.
+///
+/// Embedded images are the whole difficulty here: a signature logo is a named
+/// image part just like a genuine attachment is, and mail from the same set of
+/// correspondents arrives in both of the shapes below. Both were taken from
+/// real mail while this was written.
+///
+/// ⚠️ `mailparse` reports [`DispositionType::Inline`] both for an explicit
+/// `Content-Disposition: inline` and for a part carrying no such header at all,
+/// so the header's presence has to be checked separately:
+///
+/// - Outlook (recent): `Content-Disposition: inline; filename="image001.png"`
+///   — an explicit disposition, so the header check rejects it.
+/// - Outlook (older, and Word-generated mail): no `Content-Disposition` at all,
+///   only `Content-Type: image/png; name="image003.png"` plus a `Content-ID`
+///   that the HTML part references as `cid:`. The `Content-ID` is what marks it
+///   as embedded rather than attached.
+///
+/// An explicit `attachment` disposition always wins, `Content-ID` or not: if the
+/// sender declared it an attachment, it is one.
+fn part_is_attachment(part: &mailparse::ParsedMail<'_>) -> bool {
+    if part.ctype.mimetype.to_lowercase().starts_with("multipart/") {
+        return false;
+    }
+    let disposition = part.get_content_disposition();
+    if matches!(disposition.disposition, mailparse::DispositionType::Attachment) {
+        return true;
+    }
+    if part.headers.get_first_header("Content-Disposition").is_some() {
+        // Explicitly inline (or form-data/extension): not an attachment.
+        return false;
+    }
+    if part.headers.get_first_header("Content-ID").is_some() {
+        // Referenced from the HTML body as `cid:`, i.e. embedded, not attached.
+        return false;
+    }
+    disposition.params.contains_key("filename") || part.ctype.params.contains_key("name")
+}
+
+/// Whether a message carries at least one real attachment.
+///
+/// Only the MIME structure is inspected, never the payload, so this still works
+/// on a `.partial.emlx` whose attachment bodies have not been downloaded — the
+/// part headers and filenames are present even when the content is not.
+pub fn has_attachment(mail: &mailparse::ParsedMail<'_>) -> bool {
+    if part_is_attachment(mail) {
+        return true;
+    }
+    mail.subparts.iter().any(has_attachment)
+}
+
 /// What a message must satisfy to be returned by the scan.
 ///
 /// Grouping the criteria keeps them from being confused with each other at call
@@ -214,6 +282,8 @@ pub struct Criteria<'a> {
     pub groups: &'a [Vec<String>],
     /// Earliest message date to accept, in epoch seconds.
     pub date_cutoff: Option<i64>,
+    /// Header/structure filters, AND-ed with the query.
+    pub filters: &'a crate::models::Filters,
 }
 
 /// Process a single .emlx file and return SearchResult if it matches the criteria.
@@ -252,6 +322,15 @@ pub fn process_emlx_file(
         if timestamp.is_none_or(|ts| ts < cutoff) {
             return None;
         }
+    }
+
+    // Header and structure filters come before the body work below: both only
+    // read headers, while the body extraction decodes charsets and strips HTML.
+    if !matches_from(&mail, &criteria.filters.from_patterns) {
+        return None;
+    }
+    if criteria.filters.require_attachment && !has_attachment(&mail) {
+        return None;
     }
 
     // The body is kept header-free because the UI shows the headers separately,
@@ -297,6 +376,137 @@ mod tests {
             .join(name)
     }
 
+    // ========== matches_from / has_attachment tests ==========
+
+    // These parse a message from bytes rather than a fixture file: the point of
+    // each case is one header or one part, which reads better inline.
+    fn mail(raw: &str) -> mailparse::ParsedMail<'_> {
+        mailparse::parse_mail(raw.as_bytes()).unwrap()
+    }
+
+    fn patterns(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
+    #[test]
+    fn no_from_patterns_matches_every_message() {
+        assert!(matches_from(&mail("From: a@example.com\n\nbody"), &[]));
+    }
+
+    #[test]
+    fn from_matches_on_the_address() {
+        let msg = mail("From: Taro Suzuki <t.suzuki@example.jp>\n\nbody");
+        assert!(matches_from(&msg, &patterns(&["t.suzuki"])));
+        assert!(!matches_from(&msg, &patterns(&["tanaka"])));
+    }
+
+    #[test]
+    fn from_matches_on_the_decoded_display_name() {
+        // The header is MIME-encoded; the pattern is the plain name.
+        let msg = mail("From: =?utf-8?B?5bGx55Sw?= <s@example.jp>\n\nbody");
+        assert!(matches_from(&msg, &patterns(&["山田"])));
+    }
+
+    #[test]
+    fn from_patterns_are_or_combined() {
+        let msg = mail("From: b@example.com\n\nbody");
+        assert!(matches_from(&msg, &patterns(&["a@example.com", "b@example.com"])));
+    }
+
+    #[test]
+    fn a_message_without_a_from_header_matches_no_pattern() {
+        assert!(!matches_from(&mail("Subject: x\n\nbody"), &patterns(&["a"])));
+    }
+
+    #[test]
+    fn a_plain_message_has_no_attachment() {
+        assert!(!has_attachment(&mail(
+            "From: a@example.com\nContent-Type: text/plain\n\nbody"
+        )));
+    }
+
+    #[test]
+    fn text_and_html_alternatives_are_not_attachments() {
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/alternative; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nplain\n",
+            "--b\nContent-Type: text/html\n\n<p>html</p>\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_declared_attachment_part_counts() {
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"a.pdf\"\n\nJVBER\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn an_explicitly_inline_image_does_not_count() {
+        // Outlook signature logos arrive exactly like this, on almost every
+        // message from some correspondents; counting them would make
+        // --has-attachment useless.
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/related; boundary=b\n\n",
+            "--b\nContent-Type: text/html\n\n<p>hi</p>\n",
+            "--b\nContent-Type: image/png; name=\"image001.png\"\n",
+            "Content-Disposition: inline; filename=\"image001.png\"\n\niVBOR\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_named_image_with_a_content_id_does_not_count() {
+        // The older-Outlook signature shape: no Content-Disposition at all, so
+        // only the Content-ID separates it from a real attachment. Counting it
+        // let two signature-only messages through --has-attachment.
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/related; boundary=b\n\n",
+            "--b\nContent-Type: text/html\n\n<img src=3D\"cid:image003.png@01DD\">\n",
+            "--b\nContent-Type: image/png; name=\"image003.png\"\n",
+            "Content-ID: <image003.png@01DD3CA1.F97A3580>\n\niVBOR\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_declared_attachment_counts_even_with_a_content_id() {
+        // An explicit disposition is the sender's own answer; trust it.
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: image/png; name=\"chart.png\"\n",
+            "Content-ID: <chart@example.com>\n",
+            "Content-Disposition: attachment; filename=\"chart.png\"\n\niVBOR\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_named_part_without_a_disposition_header_counts() {
+        // mailparse reports Inline for a missing Content-Disposition, so this is
+        // the case that the header-presence check exists for.
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf; name=\"x.pdf\"\n\nJVBER\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn an_attachment_only_message_with_no_multipart_counts() {
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: application/ms-tnef; name=\"winmail.dat\"\n",
+            "Content-Disposition: attachment; filename=\"winmail.dat\"\n\ndata\n"
+        ))));
+    }
+
     // ========== matches_query tests ==========
 
     // Helper: build query groups from a single AND-group string (no --or terms).
@@ -322,9 +532,11 @@ mod tests {
         date_cutoff: Option<i64>,
     ) -> Option<crate::models::SearchResult> {
         let groups = q(query);
+        let filters = crate::models::Filters::default();
         let criteria = Criteria {
             groups: &groups,
             date_cutoff,
+            filters: &filters,
         };
         process_emlx_file(path, mtime, &criteria)
     }

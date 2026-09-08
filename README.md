@@ -11,7 +11,7 @@ A fast full-text search tool for Apple Mail `.emlx` files with an interactive te
 - **Search highlighting** - Matching search terms are highlighted in yellow bold text
 - **Recent-mail search** - `--this-week` / `--days N` restrict the search to a recent period, skipping most files without reading them. On a 230k-message mailbox this cuts CPU time by roughly 8x. See [Date windows](#date-windows).
 - **Flexible sorting** - Sort results by date (ascending/descending), subject, from, or to fields, interactively or via the `--sort` flag
-- **JSON output** - `--json` prints results to stdout for scripting and integration with other tools
+- **Machine-readable output** - `--json` prints results to stdout for scripting; `--tsv` prints one TAB-separated line per result for `cut`/`awk`/`column`
 - **Advanced filtering** - Filter results by sender, recipient, subject, date range, or full-text search
 - **macOS integration** - QuickLook preview and open emails with default system applications
 - **Performance optimized** - Parallel processing for unlimited searches, sequential with early termination for limited results
@@ -36,11 +36,13 @@ The release binary will be at `target/release/mailsearch`.
 
 ```bash
 mailsearch [OPTIONS] <QUERY>
+mailsearch [OPTIONS] --or <TERMS>...
+mailsearch [OPTIONS] --from <PATTERN>
 ```
 
 ### Arguments
 
-- `<QUERY>` - Search terms (space-separated, AND logic applied). Combine with `--or` for OR search (see below).
+- `<QUERY>` - Search terms (space-separated, AND logic applied). Combine with `--or` for OR search (see below). Optional when the search is defined by `--or`, `--from` or `--has-attachment` instead.
 
   Quoting is optional: `mailsearch hello world` and `mailsearch "hello world"` are the same AND search. Put `--` first if a term itself starts with `-`, so it is not read as a flag.
 
@@ -48,13 +50,16 @@ mailsearch [OPTIONS] <QUERY>
 
 ### Options
 
-- `-o, --or <TERMS>` - Add an OR group (repeatable). Each group is AND-matched internally, and groups are OR-combined. The whole search still runs in a single scan. See [OR search](#or-search).
+- `-o, --or <TERMS>` - Add an OR group (repeatable). Each group is AND-matched internally, and groups are OR-combined. The whole search still runs in a single scan. Supplies the whole search when no `<QUERY>` is given. See [OR search](#or-search).
+- `--from <PATTERN>` - Only match messages whose `From` header contains PATTERN. Repeatable, and repeats are OR-combined (`--from a --from b` = from either). Matched case-insensitively against the MIME-decoded header, so both the display name and the address work. AND-ed with the query. See [Filters](#filters).
+- `--has-attachment` - Only match messages carrying a real attachment. Embedded images (signature logos and the like) do not count. See [Filters](#filters).
 - `-r, --mail-root <DIR>` - Path to Apple Mail directory (default: `~/Library/Mail/V10`)
 - `-l, --limit <N>` - Limit number of results (default: unlimited)
 - `--this-week` - Only search mail from the last 7 days. Shorthand for `--days 7`. See [Date windows](#date-windows).
 - `--days <N>` - Only search mail from the last N days (max 36500). `--days 0` means today only. Cannot be combined with `--this-week`.
 - `--sort <ORDER>` - Sort results before display/output. One of `none` (default), `date-asc`, `date-desc`, `subject`, `from`, `to`. When combined with `--limit`, results are sorted first and then truncated (i.e. the top-N).
 - `--json` - Print results to stdout as a JSON array instead of launching the TUI. Each entry contains `subject`, `from`, `to`, `cc`, `date`, `timestamp` (Unix epoch seconds, `null` if the date could not be determined), `message_id` (angle brackets included, `null` if the message has none — e.g. an unsent draft), and `path`. The message body is omitted.
+- `--tsv` - Print one TAB-separated line per result instead of launching the TUI: `date`, `from`, `subject`, `message-id`, `path`. No header row. Cannot be combined with `--json`. See [Machine-readable output](#machine-readable-output).
 
 ### Examples
 
@@ -104,7 +109,7 @@ Things worth knowing:
 - **`--days 0` means today**, not "no window". Omitting both flags is how you search everything.
 - **Mail with a future date always matches**, since the window has no upper bound. Some spam sets its `Date:` header years ahead.
 - **Mail with no readable `Date:` header falls back to the file's mtime**, so it is included when the file itself is recent rather than being silently dropped.
-- **`--limit` alone does not give you the newest N.** It truncates in filesystem walk order. For the most recent matches, combine it with `--sort date-desc`.
+- **`--limit` alone does not give you the newest N.** It truncates in filesystem walk order. For the most recent matches, combine it with `--sort date-desc`. It counts distinct messages, not files (see [Duplicate copies](#duplicate-copies)).
 - **Dates are displayed in UTC**, including the `since ...` line printed at startup, so they may differ from your wall clock.
 
 ### OR search
@@ -122,9 +127,85 @@ mailsearch hello --or world --or today
 
 # (urgent AND invoice) OR (至急 AND 請求)
 mailsearch "urgent invoice" --or "至急 請求"
+
+# Every group as --or: the positional query may be left out entirely
+mailsearch --or world --or today
 ```
 
+The first group may be written either way — `mailsearch hello --or world` and
+`mailsearch --or hello --or world` are the same search. Leaving the positional
+out keeps generated command lines uniform, so a caller assembling N terms need
+not treat the first one differently.
+
 All matched terms across every group are highlighted in the TUI.
+
+### Filters
+
+`--from` and `--has-attachment` narrow the scan by header and by message
+structure. They are AND-ed with the query and with each other, so they answer a
+different kind of question than `--or` does — and either one is a complete
+search on its own, with no query at all:
+
+```bash
+# Every message this person sent in the last three weeks that carries a file
+mailsearch --days 21 --from t.suzuki --has-attachment
+
+# Three correspondents who share a surname, across their three addresses
+mailsearch --days 21 --from yamada8010 --from yamada-hiroshi --from yamada-m
+
+# Still AND-ed with the query: invoices from this sender
+mailsearch invoice --from accounts@example.com
+```
+
+`--from` exists because the query itself is matched against the headers *and*
+the body, so searching for an address also finds every reply that quotes it.
+Restricting to the sender is what the query cannot express.
+
+`--has-attachment` inspects only the MIME structure, never the payload, so it
+works on messages Apple Mail has not fully downloaded yet
+(`*.partial.emlx`) — the part headers and filenames are present even when the
+content is not. Deciding what counts as an attachment is the fiddly part; see
+`part_is_attachment` in `src/email.rs` for the two shapes an embedded signature
+image arrives in and why each is excluded.
+
+### Machine-readable output
+
+`--json` emits the full metadata for each result. `--tsv` emits the same
+identifying fields as one TAB-separated line per result, in this column order:
+
+```
+date <TAB> from <TAB> subject <TAB> message-id <TAB> path
+```
+
+There is no header row, so the output pipes straight into the usual tools:
+
+```bash
+# The candidate list, as a readable table
+mailsearch --tsv --days 21 --from t.suzuki --has-attachment | cut -f1-3 | column -t -s$'\t'
+
+# Just the paths, to hand to another tool
+mailsearch --tsv --days 21 --from t.suzuki --has-attachment | cut -f5
+```
+
+TAB is the separator because a tab cannot survive inside a header value, where
+it counts as folding whitespace, while a printable separator such as `|` does
+appear in real subjects. Should a value contain a tab anyway, it is replaced
+with a space so the column count stays fixed.
+
+### Duplicate copies
+
+Apple Mail keeps more than one `.emlx` for the same message — adjacent sequence
+numbers within a mailbox, plus a stale file left behind when a message is moved
+from INBOX to Archive. A raw scan therefore sees the same message two or three
+times; measured on real mail, 11 messages with attachments were found as 22
+files.
+
+**Results are collapsed by `Message-ID`, so each message is reported once.** Of
+the copies, a fully downloaded file is preferred over a `*.partial.emlx`, so the
+`path` can be read from disk without asking Apple Mail for the body. Messages
+with no `Message-ID` (an unsent draft, say) are never merged: there is no
+identity to merge them by. `total_seen` still counts files, so the "no .emlx
+found" diagnostic is unaffected.
 
 ## TUI Controls
 

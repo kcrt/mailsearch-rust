@@ -47,6 +47,24 @@ fn expand_mail_root_path(mail_root: PathBuf) -> Result<PathBuf> {
     Ok(expanded)
 }
 
+/// One result as a TAB-separated line: date, from, subject, message-id, path.
+///
+/// No header row, so the output pipes straight into `cut`/`awk`; the column
+/// order is documented in the README. A tab inside a value would shift every
+/// later column, so values are cleaned rather than quoted — headers cannot
+/// legitimately contain one, and a path with a tab is pathological.
+fn tsv_line(result: &models::SearchResult) -> String {
+    let field = |value: &str| value.replace('\t', " ");
+    [
+        field(&result.date_str),
+        field(&result.from_addr),
+        field(&result.subject),
+        field(result.message_id.as_deref().unwrap_or("")),
+        field(&result.file_path),
+    ]
+    .join("\t")
+}
+
 fn main() -> Result<()> {
     let mut config = Config::parse();
 
@@ -68,20 +86,18 @@ fn main() -> Result<()> {
     let groups = email::parse_query_groups(&query, &config.or_terms);
     // Flattened, pre-lowercased term list for highlighting any matched term.
     let highlight_terms: Vec<String> = groups.iter().flatten().cloned().collect();
+    // Header/structure filters (--from, --has-attachment), AND-ed with the query.
+    let filters = config.filters();
     // Human-readable query used for status messages and the TUI header.
-    let display_query = if config.or_terms.is_empty() {
-        query.clone()
-    } else {
-        format!("{} OR {}", query, config.or_terms.join(" OR "))
-    };
+    let display_query = config.display_query();
 
     // Restrict the scan to a date window when asked. This is both a filter and the
     // main speedup: most files can be skipped without being read.
     let days = config.days_window();
     let window = days.map(timewindow::window_now);
 
-    // Status messages would corrupt stdout in JSON mode; suppress them there.
-    if !config.json {
+    // Status messages would corrupt stdout in JSON/TSV mode; suppress them there.
+    if !config.machine_output() {
         println!("Searching Mail files...");
         println!("   Directory: {}", config.mail_root.display());
         println!("   Query: {}", display_query);
@@ -108,7 +124,7 @@ fn main() -> Result<()> {
     } else {
         usize::MAX
     };
-    let outcome = search_messages(&config.mail_root, &groups, scan_limit, window);
+    let outcome = search_messages(&config.mail_root, &groups, &filters, scan_limit, window);
     if outcome.total_seen == 0 {
         eprintln!("\nError: No .emlx files found in the Mail directory.");
         eprintln!("\nPlease ensure that the Mail directory is correct and accessible from this tool.");
@@ -124,6 +140,10 @@ fn main() -> Result<()> {
 
     if config.json {
         println!("{}", serde_json::to_string_pretty(&results)?);
+    } else if config.tsv {
+        for result in &results {
+            println!("{}", tsv_line(result));
+        }
     } else if results.is_empty() {
         // Name the window explicitly, so an empty result set doesn't read as
         // "the query matched nothing" when it was the date restriction.

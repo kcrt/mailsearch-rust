@@ -37,6 +37,22 @@ pub struct SearchResult {
     pub content: String,
 }
 
+/// Filters that narrow the scan by header or message structure, alongside the
+/// text query.
+///
+/// Kept apart from the query groups because these are AND-ed with the query
+/// (and with each other) rather than OR-ed into it: `--from a --from b` means
+/// "from a or b", but a `--from` hit must still satisfy the query.
+#[derive(Debug, Clone, Default)]
+pub struct Filters {
+    /// Lowercased patterns matched against the `From` header; a message passes
+    /// when its `From` contains **any** of them. Empty = no sender filter.
+    pub from_patterns: Vec<String>,
+    /// Require at least one real attachment. Inline parts (signature images and
+    /// the like) do not count.
+    pub require_attachment: bool,
+}
+
 // Default Mail directory
 pub const DEFAULT_MAIL_ROOT: &str = "Library/Mail/V10";
 
