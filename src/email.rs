@@ -312,6 +312,41 @@ pub struct Criteria<'a> {
     pub filters: &'a crate::models::Filters,
 }
 
+/// The RFC 822 message inside an `.emlx` file.
+///
+/// An `.emlx` is three parts: a first line giving the message length in bytes,
+/// the message itself, and an Apple property list of Mail's own metadata. Every
+/// file has the trailing plist — all 233,847 of them on a real mailbox — so
+/// **dropping the first line is not enough**; the length has to be used.
+///
+/// Getting this wrong is easy to miss. In a multipart message the plist lands
+/// after the closing boundary, where the parser ignores it. In a single-part
+/// message it lands *inside the body*, and for the `Content-Transfer-Encoding:
+/// base64` that Apple Mail uses for its own outgoing mail it is decoded along
+/// with the message, appending binary rubbish to the text:
+///
+/// ```text
+/// 2026年3月28日 9:00: みどり中央クリニック          <- the message
+/// 2026年3月28日 9:00: みどり中央クリニック1[ޮȨ]... <- without the length
+/// ```
+///
+/// A length that is missing, unparsable, or longer than the file falls back to
+/// "everything after the first line", which is what this did before: a wrong
+/// length should cost the old rubbish, not the whole message.
+fn rfc822_slice(bytes: &[u8]) -> Option<&[u8]> {
+    // `position(..)? + 1` also guards a truncated file with no newline at all,
+    // and yields an empty slice when the newline is the final byte.
+    let mime_start = bytes.iter().position(|&b| b == b'\n')? + 1;
+    let rest = &bytes[mime_start..];
+    let length = std::str::from_utf8(&bytes[..mime_start])
+        .ok()
+        .and_then(|line| line.trim().parse::<usize>().ok());
+    Some(match length {
+        Some(length) if length <= rest.len() => &rest[..length],
+        _ => rest,
+    })
+}
+
 /// Process a single .emlx file and return SearchResult if it matches the criteria.
 ///
 /// `mtime` is the file's modification time in epoch seconds when it was already
@@ -326,16 +361,8 @@ pub fn process_emlx_file(
     // decoding is `mailparse`'s job anyway (`get_body` honours the charset).
     let bytes = std::fs::read(path).ok()?;
 
-    // .emlx format:
-    // Line 1: Byte count
-    // Line 2+: MIME content
-    //
-    // `position(..)? + 1` also guards a truncated file with no newline at all,
-    // and yields an empty slice when the newline is the final byte.
-    let mime_start = bytes.iter().position(|&b| b == b'\n')? + 1;
-
     // Parse as email
-    let mail = mailparse::parse_mail(&bytes[mime_start..]).ok()?;
+    let mail = mailparse::parse_mail(rfc822_slice(&bytes)?).ok()?;
 
     // Resolve the date first: it is cheap, and lets a message outside the window
     // be rejected before the expensive body extraction and HTML stripping.
@@ -511,6 +538,63 @@ mod tests {
             "Content-Disposition: attachment; filename=\"chart.png\"\n\niVBOR\n",
             "--b--\n"
         ))));
+    }
+
+    // ========== rfc822_slice tests ==========
+
+    /// An `.emlx` as Mail writes it, without the plist: length line, message.
+    ///
+    /// The count has to be right — [`rfc822_slice`] slices by it, so a
+    /// placeholder would truncate the fixture rather than the plist.
+    fn emlx(message: &str) -> String {
+        format!("{}\n{message}", message.len())
+    }
+
+    /// The same, with the trailing Apple plist every real `.emlx` carries.
+    fn emlx_with_plist(message: &str) -> Vec<u8> {
+        let plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist><dict/></plist>\n";
+        format!("{}\n{message}{plist}", message.len()).into_bytes()
+    }
+
+    #[test]
+    fn the_trailing_plist_is_cut_off() {
+        let raw = emlx_with_plist("Subject: hi\n\nbody\n");
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
+    }
+
+    #[test]
+    fn a_single_part_body_does_not_swallow_the_plist() {
+        // The case that appended binary rubbish to Apple Mail's own sent mail.
+        let raw = emlx_with_plist("Content-Type: text/plain\n\nhello\n");
+        let mail = mailparse::parse_mail(rfc822_slice(&raw).unwrap()).unwrap();
+        assert_eq!(extract_email_text(&mail).trim(), "hello");
+    }
+
+    #[test]
+    fn a_missing_length_falls_back_to_everything_after_the_first_line() {
+        // A plain `.eml` handed to the tool, or a file whose first line is not a
+        // number: keep the old behaviour rather than losing the message.
+        let raw = b"Subject: hi\n\nbody\n".to_vec();
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"\nbody\n");
+    }
+
+    #[test]
+    fn a_length_longer_than_the_file_falls_back() {
+        let raw = b"99999\nSubject: hi\n\nbody\n".to_vec();
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
+    }
+
+    #[test]
+    fn a_file_with_no_newline_at_all_is_rejected() {
+        assert!(rfc822_slice(b"12345").is_none());
+    }
+
+    #[test]
+    fn a_length_line_ending_in_crlf_still_parses() {
+        // "Subject: hi\n\nbody\n" is 18 bytes; the trailing text stands in for
+        // the plist and must be cut off despite the \r before the newline.
+        let raw = b"18\r\nSubject: hi\n\nbody\nTRAILING".to_vec();
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
     }
 
     #[test]
@@ -905,6 +989,13 @@ mod tests {
         assert_eq!(search_result.subject, "Test Plain Text Email");
         assert!(search_result.from_addr.contains("sender@example.com"));
         assert!(search_result.content.contains("rust programming"));
+        // The fixture carries the trailing Apple plist every real `.emlx` has.
+        // Slicing by the length line is what keeps it out of the body.
+        assert!(
+            !search_result.content.contains("plist"),
+            "the trailing plist leaked into the body: {}",
+            search_result.content
+        );
     }
 
     #[test]
@@ -1090,7 +1181,7 @@ mod tests {
         let path = dir.path().join("blank_id.emlx");
         std::fs::write(
             &path,
-            "42\nFrom: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n",
+            &emlx("From: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n"),
         )
         .unwrap();
 
@@ -1140,7 +1231,7 @@ mod tests {
         // Byte-count line, then a message with no Date: header at all.
         std::fs::write(
             &path,
-            "42\nFrom: sender@example.com\nSubject: No date here\n\nquarterly report body\n",
+            &emlx("From: sender@example.com\nSubject: No date here\n\nquarterly report body\n"),
         )
         .unwrap();
 

@@ -309,7 +309,7 @@ If you see permission errors, grant Full Disk Access:
 ## How It Works
 
 1. **Discovery** - Recursively finds all `.emlx` files in the mail directory. With `--from`, Apple Mail's Envelope Index is consulted first and files it rules out are dropped before anything else (see [Envelope Index](#envelope-index)). With `--this-week` / `--days N`, files whose modification time predates the window are dropped here without being read (see [Date windows](#date-windows))
-2. **Parsing** - Extracts headers and body content from each email, handling both plain text and HTML. The `Date:` header is resolved first, so mail outside the window is discarded before the expensive body extraction
+2. **Parsing** - Slices the RFC 822 message out of the `.emlx` using its byte-count line, so Mail's trailing property list never reaches the parser, then extracts headers and body content, handling both plain text and HTML. The `Date:` header is resolved first, so mail outside the window is discarded before the expensive body extraction
 3. **Search** - Searches extracted content for the query terms (AND within a group, OR across `--or` groups)
 4. **Display** - Shows results in interactive TUI with highlighted matches
 

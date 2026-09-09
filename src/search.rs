@@ -272,10 +272,18 @@ mod tests {
     use std::fs::File;
     use std::time::Duration;
 
+    /// Wrap a message as Apple Mail writes it: byte-count line, then the message.
+    ///
+    /// The count has to be right — [`crate::email`] slices by it to cut off the
+    /// trailing plist, so a placeholder here would truncate the fixture instead.
+    fn emlx(message: &str) -> String {
+        format!("{}\n{message}", message.len())
+    }
+
     /// Create an `.emlx`-shaped file and set its mtime to `epoch` seconds.
     fn write_file(dir: &Path, name: &str, epoch: i64) {
         let path = dir.join(name);
-        std::fs::write(&path, "42\nSubject: test\n\nbody\n").unwrap();
+        std::fs::write(&path, emlx("Subject: test\n\nbody\n")).unwrap();
         let file = File::options().write(true).open(&path).unwrap();
         file.set_modified(UNIX_EPOCH + Duration::from_secs(epoch as u64))
             .unwrap();
@@ -283,7 +291,7 @@ mod tests {
 
     /// Create an `.emlx`-shaped file carrying `message_id`, for dedupe tests.
     fn write_message(dir: &Path, name: &str, message_id: &str) {
-        let raw = format!("42\nSubject: test\nMessage-ID: <{message_id}>\n\nbody\n");
+        let raw = emlx(&format!("Subject: test\nMessage-ID: <{message_id}>\n\nbody\n"));
         std::fs::write(dir.join(name), raw).unwrap();
     }
 
@@ -467,7 +475,7 @@ mod tests {
         let path = dir.path().join("msg.emlx");
         std::fs::write(
             &path,
-            "42\nSubject: Report\nDate: Tue, 20 Jan 2026 10:30:00 +0000\n\nquarterly report\n",
+            emlx("Subject: Report\nDate: Tue, 20 Jan 2026 10:30:00 +0000\n\nquarterly report\n"),
         )
         .unwrap();
         let file = File::options().write(true).open(&path).unwrap();
