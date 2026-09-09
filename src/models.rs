@@ -51,6 +51,14 @@ pub struct Filters {
     /// Require at least one real attachment. Inline parts (signature images and
     /// the like) do not count.
     pub require_attachment: bool,
+    /// Lowercased patterns matched against attachment filenames; a message
+    /// passes when **any** attachment name contains **any** of them. Empty = no
+    /// filter.
+    ///
+    /// Not pushed down to the Envelope Index even though it holds attachment
+    /// names, for the same reason `require_attachment` is not: that table is
+    /// incomplete. See [`crate::index`].
+    pub attachment_names: Vec<String>,
     /// Match only the message with exactly this `Message-ID`, angle brackets
     /// stripped. `None` = no restriction.
     ///

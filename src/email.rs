@@ -93,7 +93,10 @@ pub fn strip_html_tags(html: &str) -> String {
     // Remove remaining HTML tags
     let text = html_tag_regex().replace_all(&text, " ");
     // Normalize whitespace
-    whitespace_regex().replace_all(&text, " ").trim().to_string()
+    whitespace_regex()
+        .replace_all(&text, " ")
+        .trim()
+        .to_string()
 }
 
 /// Clean embedded newlines from header values.
@@ -259,10 +262,17 @@ fn part_is_attachment(part: &mailparse::ParsedMail<'_>) -> bool {
         return false;
     }
     let disposition = part.get_content_disposition();
-    if matches!(disposition.disposition, mailparse::DispositionType::Attachment) {
+    if matches!(
+        disposition.disposition,
+        mailparse::DispositionType::Attachment
+    ) {
         return true;
     }
-    if part.headers.get_first_header("Content-Disposition").is_some() {
+    if part
+        .headers
+        .get_first_header("Content-Disposition")
+        .is_some()
+    {
         // Explicitly inline (or form-data/extension): not an attachment.
         return false;
     }
@@ -293,6 +303,40 @@ fn is_detached_signature(mimetype: &str) -> bool {
             | "application/x-pkcs7-signature"
             | "application/pgp-signature"
     )
+}
+
+/// Every real attachment's filename, lowercased for matching.
+///
+/// Uses the same notion of "real" as [`has_attachment`], so `--attachment-name`
+/// and `--has-attachment` cannot disagree about what a message contains.
+fn attachment_names(mail: &mailparse::ParsedMail<'_>, out: &mut Vec<String>) {
+    if part_is_attachment(mail) {
+        let disposition = mail.get_content_disposition();
+        if let Some(name) = disposition
+            .params
+            .get("filename")
+            .or_else(|| mail.ctype.params.get("name"))
+        {
+            out.push(crate::message::decode_encoded_words(name).to_lowercase());
+        }
+    }
+    for subpart in &mail.subparts {
+        attachment_names(subpart, out);
+    }
+}
+
+/// Whether any attachment's name contains any of `patterns`.
+///
+/// Patterns are expected to arrive lowercased, as the names are lowercased here.
+pub fn matches_attachment_name(mail: &mailparse::ParsedMail<'_>, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let mut names = Vec::new();
+    attachment_names(mail, &mut names);
+    names
+        .iter()
+        .any(|name| patterns.iter().any(|pattern| name.contains(pattern)))
 }
 
 /// Whether a message carries at least one real attachment.
@@ -399,6 +443,9 @@ pub fn process_emlx_file(
     if criteria.filters.require_attachment && !has_attachment(&mail) {
         return None;
     }
+    if !matches_attachment_name(&mail, &criteria.filters.attachment_names) {
+        return None;
+    }
 
     // The body is kept header-free because the UI shows the headers separately,
     // but the query is matched against both: a sender, recipient or subject that
@@ -477,12 +524,18 @@ mod tests {
     #[test]
     fn from_patterns_are_or_combined() {
         let msg = mail("From: b@example.com\n\nbody");
-        assert!(matches_from(&msg, &patterns(&["a@example.com", "b@example.com"])));
+        assert!(matches_from(
+            &msg,
+            &patterns(&["a@example.com", "b@example.com"])
+        ));
     }
 
     #[test]
     fn a_message_without_a_from_header_matches_no_pattern() {
-        assert!(!matches_from(&mail("Subject: x\n\nbody"), &patterns(&["a"])));
+        assert!(!matches_from(
+            &mail("Subject: x\n\nbody"),
+            &patterns(&["a"])
+        ));
     }
 
     #[test]
@@ -609,6 +662,86 @@ mod tests {
         // the plist and must be cut off despite the \r before the newline.
         let raw = b"18\r\nSubject: hi\n\nbody\nTRAILING".to_vec();
         assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
+    }
+
+    // ========== matches_attachment_name ==========
+
+    #[test]
+    fn an_attachment_name_pattern_matches_a_substring() {
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"2026 report final.pdf\"\n\nJVBER\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(&m, &["report".to_string()]));
+        assert!(!matches_attachment_name(&m, &["invoice".to_string()]));
+    }
+
+    #[test]
+    fn no_attachment_name_pattern_matches_everything() {
+        let m = mail("Content-Type: text/plain\n\nbody\n");
+        assert!(matches_attachment_name(&m, &[]));
+    }
+
+    #[test]
+    fn an_attachment_name_pattern_is_case_insensitive_for_ascii() {
+        // Patterns arrive lowercased from `Config::filters`.
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"Report.PDF\"\n\nJVBER\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(&m, &["report.pdf".to_string()]));
+    }
+
+    #[test]
+    fn repeated_attachment_name_patterns_are_or_combined() {
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"report.pdf\"\n\nJVBER\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(
+            &m,
+            &["invoice".to_string(), "report".to_string()]
+        ));
+    }
+
+    #[test]
+    fn a_signature_image_name_is_not_matchable() {
+        // Otherwise `--attachment-name image001` would hit half the mailbox.
+        let m = mail(concat!(
+            "Content-Type: multipart/related; boundary=b\n\n",
+            "--b\nContent-Type: text/html\n\n<img src=\"cid:i\">\n",
+            "--b\nContent-Type: image/png; name=\"image001.png\"\n",
+            "Content-ID: <i>\n\niVBOR\n",
+            "--b--\n"
+        ));
+        assert!(!matches_attachment_name(&m, &["image001".to_string()]));
+    }
+
+    #[test]
+    fn a_japanese_attachment_name_is_matchable() {
+        // The name arrives RFC 2047 encoded and must be decoded before matching,
+        // or a search for the case number could never hit.
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/x-zip-compressed\n",
+            "Content-Disposition: attachment;\n",
+            "\tfilename*0=\"=?iso-2022-jp?B?GyRCPzc1LBsoQjI2MDQxNSAbJEJOURsoQjIwMjYtMDAxIBsk\";\n",
+            "\tfilename*1=\"QjszGyhC?=  =?iso-2022-jp?B?GyRCRURCQE86GyhCKBskQj9XQi4bKEIpGyRC\";\n",
+            "\tfilename*2=\"M1gycRsoQi56aXA=?=\"\n\nUEsD\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(&m, &["倫2026-001".to_string()]));
+        assert!(matches_attachment_name(&m, &["山田".to_string()]));
     }
 
     #[test]
@@ -745,8 +878,14 @@ mod tests {
     #[test]
     fn test_matches_query_multiple_terms_and_logic() {
         // All terms must be present (AND logic)
-        assert!(matches_query("rust programming language", &q("rust language")));
-        assert!(matches_query("rust programming language", &q("rust programming")));
+        assert!(matches_query(
+            "rust programming language",
+            &q("rust language")
+        ));
+        assert!(matches_query(
+            "rust programming language",
+            &q("rust programming")
+        ));
         assert!(!matches_query("rust programming", &q("rust java")));
         assert!(!matches_query("rust", &q("rust java")));
     }
@@ -985,7 +1124,6 @@ mod tests {
         );
     }
 
-
     // ========== process_emlx_file integration tests ==========
 
     #[test]
@@ -998,7 +1136,7 @@ mod tests {
 
         let result = scan(&path, "rust programming");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         assert_eq!(search_result.subject, "Test Plain Text Email");
         assert!(search_result.from_addr.contains("sender@example.com"));
@@ -1021,7 +1159,7 @@ mod tests {
 
         let result = scan(&path, "invoice receipt");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         assert_eq!(search_result.subject, "HTML Test Email");
         // HTML tags should be stripped
@@ -1039,7 +1177,7 @@ mod tests {
 
         let result = scan(&path, "project update");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         assert_eq!(search_result.subject, "Multipart Email Test");
         assert!(search_result.content.contains("project update"));
@@ -1054,7 +1192,7 @@ mod tests {
 
         let result = scan(&path, "without");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         // Should use NO_SUBJECT constant
         assert!(search_result.subject.contains("No Subject") || search_result.subject.is_empty());
@@ -1293,6 +1431,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let result = scan(&path, "会議");
-        assert!(result.is_some(), "Shift_JIS body should be decoded and matched");
+        assert!(
+            result.is_some(),
+            "Shift_JIS body should be decoded and matched"
+        );
     }
 }

@@ -39,6 +39,7 @@ The release binary will be at `target/release/mailsearch`.
 mailsearch [OPTIONS] <QUERY>
 mailsearch [OPTIONS] --or <TERMS>...
 mailsearch [OPTIONS] --from <PATTERN>
+mailsearch [OPTIONS] --attachment-name <PATTERN>
 
 mailsearch dump [OPTIONS] <TARGET>...          # print a message as text
 mailsearch attachments [OPTIONS] <TARGET>...   # list or save its attachments
@@ -56,6 +57,7 @@ mailsearch attachments [OPTIONS] <TARGET>...   # list or save its attachments
 
 - `-o, --or <TERMS>` - Add an OR group (repeatable). Each group is AND-matched internally, and groups are OR-combined. The whole search still runs in a single scan. Supplies the whole search when no `<QUERY>` is given. See [OR search](#or-search).
 - `--from <PATTERN>` - Only match messages whose `From` header contains PATTERN. Repeatable, and repeats are OR-combined (`--from a --from b` = from either). Matched case-insensitively against the MIME-decoded header, so both the display name and the address work. AND-ed with the query. See [Filters](#filters).
+- `--attachment-name <PATTERN>` - Only match messages with an attachment whose filename contains PATTERN. Repeatable, and repeats are OR-combined. Matched case-insensitively against the decoded name. See [Filters](#filters).
 - `--has-attachment` - Only match messages carrying a real attachment. Embedded images (signature logos and the like) and detached cryptographic signatures (`smime.p7s`, `signature.asc`) do not count. See [Filters](#filters).
 - `--no-index` - Ignore Apple Mail's Envelope Index and read every message file. An escape hatch; the results are the same either way, only slower. See [Envelope Index](#envelope-index).
 - `-r, --mail-root <DIR>` - Path to Apple Mail directory (default: `~/Library/Mail/V10`)
@@ -212,8 +214,8 @@ All matched terms across every group are highlighted in the TUI.
 
 ### Filters
 
-`--from` and `--has-attachment` narrow the scan by header and by message
-structure. They are AND-ed with the query and with each other, so they answer a
+`--from`, `--has-attachment` and `--attachment-name` narrow the scan by header
+and by message structure. They are AND-ed with the query and with each other, so they answer a
 different kind of question than `--or` does — and either one is a complete
 search on its own, with no query at all:
 
@@ -226,11 +228,24 @@ mailsearch --days 21 --from yamada8010 --from yamada-hiroshi --from yamada-m
 
 # Still AND-ed with the query: invoices from this sender
 mailsearch invoice --from accounts@example.com
+
+# The zip the committee office sent, by what it was called
+mailsearch --attachment-name '倫2026-001'
 ```
 
 `--from` exists because the query itself is matched against the headers *and*
 the body, so searching for an address also finds every reply that quotes it.
 Restricting to the sender is what the query cannot express.
+
+`--attachment-name` answers a question nothing else can: neither the query nor
+Apple Mail's own search looks at attachment filenames, so a file you remember
+receiving but not the wording of the mail was findable only from memory. It
+matches the decoded name (see [Attachment filenames](#attachment-filenames)) and
+ignores embedded images, so it will not hit every message with an `image001.png`.
+
+Neither attachment filter is pushed down to the Envelope Index, even though the
+index holds attachment names — that table is incomplete; see
+[Envelope Index](#envelope-index).
 
 `--has-attachment` inspects only the MIME structure, never the payload, so it
 works on messages Apple Mail has not fully downloaded yet

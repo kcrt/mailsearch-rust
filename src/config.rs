@@ -110,7 +110,7 @@ pub struct Config {
     #[arg(
         num_args = 1..,
         value_name = "QUERY",
-        required_unless_present_any = ["or_terms", "from", "has_attachment"]
+        required_unless_present_any = ["or_terms", "from", "has_attachment", "attachment_name"]
     )]
     pub query: Vec<String>,
 
@@ -132,6 +132,14 @@ pub struct Config {
     /// signature images do not count)
     #[arg(long = "has-attachment", default_value_t = false)]
     pub has_attachment: bool,
+
+    /// Only match messages with an attachment whose filename contains PATTERN;
+    /// repeatable (any of them matches)
+    // The question this answers has no other expression: neither the query nor
+    // Apple Mail's own search looks at attachment filenames, so "the zip the
+    // committee office sent" was previously unfindable except by memory.
+    #[arg(long = "attachment-name", value_name = "PATTERN")]
+    pub attachment_name: Vec<String>,
 
     /// Path to Mail directory
     #[arg(short = 'r', long = "mail-root", default_value = DEFAULT_MAIL_ROOT)]
@@ -225,6 +233,12 @@ impl Config {
                 .filter(|pattern| !pattern.is_empty())
                 .collect(),
             require_attachment: self.has_attachment,
+            attachment_names: self
+                .attachment_name
+                .iter()
+                .map(|pattern| pattern.trim().to_lowercase())
+                .filter(|pattern| !pattern.is_empty())
+                .collect(),
             // Only the `dump` / `attachments` lookup sets this; a search has no
             // flag for it.
             message_id: None,
@@ -263,6 +277,9 @@ impl Config {
         }
         if self.has_attachment {
             line.push_str(" +attachment");
+        }
+        if !self.attachment_name.is_empty() {
+            line.push_str(&format!(" +file:{}", self.attachment_name.join(",")));
         }
         line
     }

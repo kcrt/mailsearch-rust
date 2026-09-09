@@ -166,7 +166,7 @@ impl Message {
 /// synthetic header, rather than reimplemented: encoded-word parsing is fiddly,
 /// and the charset support behind it is the reason NEC/IBM extension characters
 /// survive at all.
-fn decode_encoded_words(value: &str) -> String {
+pub fn decode_encoded_words(value: &str) -> String {
     if !value.contains("=?") {
         return value.to_string();
     }
