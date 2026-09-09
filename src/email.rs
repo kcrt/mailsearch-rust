@@ -241,9 +241,13 @@ pub fn matches_from(mail: &mailparse::ParsedMail<'_>, patterns: &[String]) -> bo
 ///   as embedded rather than attached.
 ///
 /// An explicit `attachment` disposition always wins, `Content-ID` or not: if the
-/// sender declared it an attachment, it is one.
+/// sender declared it an attachment, it is one — with the single exception of a
+/// cryptographic signature; see [`is_detached_signature`].
 fn part_is_attachment(part: &mailparse::ParsedMail<'_>) -> bool {
     if part.ctype.mimetype.to_lowercase().starts_with("multipart/") {
+        return false;
+    }
+    if is_detached_signature(&part.ctype.mimetype) {
         return false;
     }
     let disposition = part.get_content_disposition();
@@ -259,6 +263,28 @@ fn part_is_attachment(part: &mailparse::ParsedMail<'_>) -> bool {
         return false;
     }
     disposition.params.contains_key("filename") || part.ctype.params.contains_key("name")
+}
+
+/// Whether a MIME type is a detached cryptographic signature.
+///
+/// S/MIME/PGP signed mail carries the signature as a sibling part declared
+/// `Content-Disposition: attachment` with a filename (`smime.p7s`,
+/// `signature.asc`), which is indistinguishable from a real attachment by
+/// structure alone. Nobody asking for "mail with an attachment" means a signed
+/// bank notification, and Apple Mail agrees: it does not list these as
+/// attachments either. Measured on real mail, they were **83 of the 831**
+/// messages `--has-attachment` returned over 90 days.
+///
+/// Only *detached* signatures are excluded. `application/pkcs7-mime` — signed or
+/// encrypted content rather than a signature over it — can carry the real
+/// message and its attachments, so it is left alone.
+fn is_detached_signature(mimetype: &str) -> bool {
+    matches!(
+        mimetype.to_lowercase().as_str(),
+        "application/pkcs7-signature"
+            | "application/x-pkcs7-signature"
+            | "application/pgp-signature"
+    )
 }
 
 /// Whether a message carries at least one real attachment.
@@ -483,6 +509,71 @@ mod tests {
             "--b\nContent-Type: image/png; name=\"chart.png\"\n",
             "Content-ID: <chart@example.com>\n",
             "Content-Disposition: attachment; filename=\"chart.png\"\n\niVBOR\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn an_smime_signature_is_not_an_attachment() {
+        // The shape every signed bank notification arrives in: a plain body plus
+        // a detached signature declared as an attachment. 83 of 831 hits.
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/x-pkcs7-signature; name=\"smime.p7s\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7s\"\n\nMIIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn the_unprefixed_smime_signature_type_is_also_excluded() {
+        // Both spellings occur in the wild, 19 and 64 times respectively.
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7s\"\n\nMIIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_pgp_signature_is_not_an_attachment() {
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pgp-signature; name=\"signature.asc\"\n",
+            "Content-Disposition: attachment; filename=\"signature.asc\"\n\n-----BEGIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_real_attachment_alongside_a_signature_still_counts() {
+        // Signed mail that also carries a document must not be filtered out.
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: multipart/mixed; boundary=c\n\n",
+            "--c\nContent-Type: text/plain\n\nbody\n",
+            "--c\nContent-Type: application/pdf; name=\"report.pdf\"\n",
+            "Content-Disposition: attachment; filename=\"report.pdf\"\n\nJVBER\n",
+            "--c--\n",
+            "--b\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7s\"\n\nMIIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn signed_or_encrypted_content_is_not_treated_as_a_signature() {
+        // `pkcs7-mime` wraps the real message, attachments and all, so excluding
+        // it would hide genuine attachments rather than signature noise.
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pkcs7-mime; name=\"smime.p7m\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7m\"\n\nMIIN\n",
             "--b--\n"
         ))));
     }

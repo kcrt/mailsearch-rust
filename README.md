@@ -53,7 +53,7 @@ mailsearch [OPTIONS] --from <PATTERN>
 
 - `-o, --or <TERMS>` - Add an OR group (repeatable). Each group is AND-matched internally, and groups are OR-combined. The whole search still runs in a single scan. Supplies the whole search when no `<QUERY>` is given. See [OR search](#or-search).
 - `--from <PATTERN>` - Only match messages whose `From` header contains PATTERN. Repeatable, and repeats are OR-combined (`--from a --from b` = from either). Matched case-insensitively against the MIME-decoded header, so both the display name and the address work. AND-ed with the query. See [Filters](#filters).
-- `--has-attachment` - Only match messages carrying a real attachment. Embedded images (signature logos and the like) do not count. See [Filters](#filters).
+- `--has-attachment` - Only match messages carrying a real attachment. Embedded images (signature logos and the like) and detached cryptographic signatures (`smime.p7s`, `signature.asc`) do not count. See [Filters](#filters).
 - `--no-index` - Ignore Apple Mail's Envelope Index and read every message file. An escape hatch; the results are the same either way, only slower. See [Envelope Index](#envelope-index).
 - `-r, --mail-root <DIR>` - Path to Apple Mail directory (default: `~/Library/Mail/V10`)
 - `-l, --limit <N>` - Limit number of results (default: unlimited)
@@ -166,9 +166,20 @@ Restricting to the sender is what the query cannot express.
 `--has-attachment` inspects only the MIME structure, never the payload, so it
 works on messages Apple Mail has not fully downloaded yet
 (`*.partial.emlx`) — the part headers and filenames are present even when the
-content is not. Deciding what counts as an attachment is the fiddly part; see
-`part_is_attachment` in `src/email.rs` for the two shapes an embedded signature
-image arrives in and why each is excluded.
+content is not.
+
+Deciding what counts as an attachment is the fiddly part. Two kinds of part look
+exactly like an attachment and are excluded:
+
+- **Embedded images.** A signature logo is a named image part like any other.
+  See `part_is_attachment` in `src/email.rs` for the two shapes these arrive in.
+- **Detached signatures.** S/MIME and PGP signed mail carries `smime.p7s` or
+  `signature.asc` as a sibling part declared `Content-Disposition: attachment`,
+  which no structural test can tell from a real file. Nobody looking for "mail
+  with an attachment" means a signed bank notification, and Apple Mail does not
+  list these as attachments either. On real mail they were **83 of the 831**
+  messages returned over 90 days. `application/pkcs7-mime` is *not* excluded: it
+  wraps the real message and can carry genuine attachments.
 
 ### Machine-readable output
 
