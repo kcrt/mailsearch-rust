@@ -1,6 +1,7 @@
 //! Search functionality for finding and processing email files.
 
 use crate::email::{process_emlx_file, Criteria};
+use crate::index::{rowid_from_path, Candidates};
 use crate::models::Filters;
 use crate::models::SearchResult;
 use crate::timewindow::Window;
@@ -28,13 +29,24 @@ fn to_epoch(time: SystemTime) -> Option<i64> {
         .and_then(|d| i64::try_from(d.as_secs()).ok())
 }
 
-/// Find all .emlx files in the Mail directory, optionally restricted by mtime.
+/// Find all .emlx files in the Mail directory, optionally restricted by mtime
+/// and by what Apple Mail's Envelope Index says about each message.
 ///
 /// When `window` is set, files whose mtime predates [`Window::mtime_cutoff`] are
 /// dropped without ever being read. See [`crate::timewindow`] for why that is
 /// sound. Without a window no file is stat'd at all, so an unrestricted search
 /// pays nothing for this.
-pub fn find_emlx_files(mail_root: &Path, window: Option<Window>) -> FileScan {
+///
+/// When `narrow` is set, files the index has ruled out are dropped before the
+/// mtime pass, so a sender filter also saves the stat. The index only ever
+/// removes candidates and never changes what a kept file matches, so `None`
+/// here — a missing or unreadable index — costs speed and nothing else. See
+/// [`crate::index`].
+pub fn find_emlx_files(
+    mail_root: &Path,
+    window: Option<Window>,
+    narrow: Option<&Candidates>,
+) -> FileScan {
     let spinner = ProgressBar::new_spinner();
     spinner.set_style(
         ProgressStyle::default_spinner()
@@ -58,12 +70,34 @@ pub fn find_emlx_files(mail_root: &Path, window: Option<Window>) -> FileScan {
         .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "emlx"))
         .map(|entry| entry.path().to_path_buf())
         .collect();
+    // Counted before narrowing: this is what tells "no mail directory / no Full
+    // Disk Access" apart from "the filters matched nothing", and the index must
+    // not be able to turn the former diagnostic on.
     let total_seen = candidates.len();
+
+    let candidates: Vec<PathBuf> = match narrow {
+        None => candidates,
+        Some(narrow) => {
+            spinner.set_message(format!(
+                "Narrowing {total_seen} .emlx files against {} indexed messages...",
+                narrow.known_count()
+            ));
+            candidates
+                .into_iter()
+                // A file whose name is not a message row number is kept, the same
+                // way an unknown row number is: the index cannot speak about it.
+                .filter(|path| rowid_from_path(path).is_none_or(|rowid| narrow.keeps(rowid)))
+                .collect()
+        }
+    };
 
     let files: Vec<(PathBuf, Option<i64>)> = match window {
         None => candidates.into_iter().map(|path| (path, None)).collect(),
         Some(window) => {
-            spinner.set_message(format!("Checking dates of {total_seen} .emlx files..."));
+            spinner.set_message(format!(
+                "Checking dates of {} .emlx files...",
+                candidates.len()
+            ));
             // One stat per file, so do them in parallel. `par_iter` on a `Vec`
             // preserves order, keeping the walk order (and thus `--limit`)
             // deterministic.
@@ -87,13 +121,16 @@ pub fn find_emlx_files(mail_root: &Path, window: Option<Window>) -> FileScan {
         }
     };
 
-    let message = match window {
-        None => format!("Found {} .emlx files", files.len()),
-        Some(_) => format!(
-            "Found {} of {} .emlx files recent enough to check",
+    // Say how much was skipped whenever anything was, so a fast search does not
+    // look like a search that quietly missed most of the mailbox.
+    let message = if window.is_none() && narrow.is_none() {
+        format!("Found {} .emlx files", files.len())
+    } else {
+        format!(
+            "Found {} of {} .emlx files worth reading",
             files.len(),
             total_seen
-        ),
+        )
     };
     spinner.finish_with_message(message);
 
@@ -166,14 +203,22 @@ pub struct SearchOutcome {
 }
 
 /// Search for messages matching the query, optionally restricted to a date window.
+///
+/// `use_index` asks for Apple Mail's Envelope Index to pre-select which files
+/// are worth reading. It is a pure optimisation: the same messages come back
+/// either way, so a caller that turns it off only makes the search slower.
 pub fn search_messages(
     mail_root: &Path,
     groups: &[Vec<String>],
     filters: &Filters,
     limit: usize,
     window: Option<Window>,
+    use_index: bool,
 ) -> SearchOutcome {
-    let scan = find_emlx_files(mail_root, window);
+    let narrow = use_index
+        .then(|| Candidates::load(mail_root, filters))
+        .flatten();
+    let scan = find_emlx_files(mail_root, window, narrow.as_ref());
     let criteria = Criteria {
         groups,
         date_cutoff: window.map(|w| w.date_cutoff),
@@ -245,7 +290,7 @@ mod tests {
     /// Scan for the fixture messages above, with no window and no filters.
     fn scan_all(dir: &Path, limit: usize) -> SearchOutcome {
         let groups = crate::email::parse_query_groups("test", &[]);
-        search_messages(dir, &groups, &Filters::default(), limit, None)
+        search_messages(dir, &groups, &Filters::default(), limit, None, false)
     }
 
     #[test]
@@ -327,7 +372,7 @@ mod tests {
         write_file(dir.path(), "c.emlx", 3_000_000);
         std::fs::write(dir.path().join("notes.txt"), "ignored").unwrap();
 
-        let scan = find_emlx_files(dir.path(), None);
+        let scan = find_emlx_files(dir.path(), None, None);
         assert_eq!(scan.total_seen, 3);
         assert_eq!(scan.files.len(), 3);
         // No window means no stat, so no mtime is reported.
@@ -341,7 +386,7 @@ mod tests {
         write_file(dir.path(), "old_two.emlx", 1_500_000);
         write_file(dir.path(), "recent.emlx", 3_000_000);
 
-        let scan = find_emlx_files(dir.path(), Some(window_at(2_000_000)));
+        let scan = find_emlx_files(dir.path(), Some(window_at(2_000_000)), None);
         // total_seen still reflects everything the walk found.
         assert_eq!(scan.total_seen, 3);
         assert_eq!(scan.files.len(), 1);
@@ -355,7 +400,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "old.emlx", 1_000_000);
 
-        let scan = find_emlx_files(dir.path(), Some(window_at(9_000_000)));
+        let scan = find_emlx_files(dir.path(), Some(window_at(9_000_000)), None);
         assert!(scan.files.is_empty());
         // The caller needs this to say "nothing in the window" rather than
         // "no mail directory".
@@ -365,7 +410,7 @@ mod tests {
     #[test]
     fn an_empty_directory_returns_empty_without_exiting() {
         let dir = tempfile::tempdir().unwrap();
-        let scan = find_emlx_files(dir.path(), None);
+        let scan = find_emlx_files(dir.path(), None, None);
         assert_eq!(scan.total_seen, 0);
         assert!(scan.files.is_empty());
     }
@@ -377,7 +422,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_file(dir.path(), "1234.partial.emlx", 3_000_000);
 
-        let scan = find_emlx_files(dir.path(), Some(window_at(2_000_000)));
+        let scan = find_emlx_files(dir.path(), Some(window_at(2_000_000)), None);
         assert_eq!(scan.files.len(), 1);
     }
 
@@ -393,7 +438,7 @@ mod tests {
         let link = dir.path().join("linked.emlx");
         std::os::unix::fs::symlink(target_dir.join("real.emlx"), &link).unwrap();
 
-        let scan = find_emlx_files(dir.path(), Some(window_at(2_000_000)));
+        let scan = find_emlx_files(dir.path(), Some(window_at(2_000_000)), None);
         // Both the original and the link.
         assert_eq!(scan.files.len(), 2);
         let linked = scan
@@ -411,7 +456,7 @@ mod tests {
         std::fs::create_dir_all(&nested).unwrap();
         write_file(&nested, "deep.emlx", 3_000_000);
 
-        let scan = find_emlx_files(dir.path(), None);
+        let scan = find_emlx_files(dir.path(), None, None);
         assert_eq!(scan.total_seen, 1);
     }
 
@@ -434,7 +479,7 @@ mod tests {
 
         // No window: found.
         assert_eq!(
-            search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, None)
+            search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, None, false)
                 .results
                 .len(),
             1
@@ -446,7 +491,7 @@ mod tests {
             mtime_cutoff: 1_700_000_000,
         };
         assert_eq!(
-            search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, Some(covering))
+            search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, Some(covering), false)
                 .results
                 .len(),
             1
@@ -458,14 +503,14 @@ mod tests {
             date_cutoff: 1_775_000_000, // 2026-03-31
             mtime_cutoff: 1_700_000_000,
         };
-        let scan = search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, Some(date_only));
+        let scan = search_messages(dir.path(), &groups, &Filters::default(), usize::MAX, Some(date_only), false);
         assert!(scan.results.is_empty());
         assert_eq!(scan.total_seen, 1);
 
         // A non-matching query is still a non-match inside the window.
         let other = crate::email::parse_query_groups("unrelated", &[]);
         assert!(
-            search_messages(dir.path(), &other, &Filters::default(), usize::MAX, Some(covering))
+            search_messages(dir.path(), &other, &Filters::default(), usize::MAX, Some(covering), false)
                 .results
                 .is_empty()
         );

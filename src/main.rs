@@ -10,6 +10,7 @@
 mod config;
 mod email;
 mod highlight;
+mod index;
 mod models;
 mod search;
 mod sort;
@@ -124,7 +125,14 @@ fn main() -> Result<()> {
     } else {
         usize::MAX
     };
-    let outcome = search_messages(&config.mail_root, &groups, &filters, scan_limit, window);
+    let outcome = search_messages(
+        &config.mail_root,
+        &groups,
+        &filters,
+        scan_limit,
+        window,
+        !config.no_index,
+    );
     if outcome.total_seen == 0 {
         eprintln!("\nError: No .emlx files found in the Mail directory.");
         eprintln!("\nPlease ensure that the Mail directory is correct and accessible from this tool.");

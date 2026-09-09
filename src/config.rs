@@ -81,6 +81,15 @@ pub struct Config {
     )]
     pub days: Option<u32>,
 
+    /// Ignore Apple Mail's Envelope Index and read every message file
+    // An escape hatch, not a mode: the index only decides which files are worth
+    // opening, and every file it keeps is still parsed and matched normally, so
+    // both settings return the same messages. Worth having anyway - if a search
+    // ever does disagree, re-running it with this flag says in one step whether
+    // the index was involved.
+    #[arg(long = "no-index", default_value_t = false)]
+    pub no_index: bool,
+
     /// Output results as JSON to stdout instead of the interactive TUI
     #[arg(long = "json", default_value_t = false)]
     pub json: bool,

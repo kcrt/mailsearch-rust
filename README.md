@@ -10,6 +10,7 @@ A fast full-text search tool for Apple Mail `.emlx` files with an interactive te
 - **Interactive TUI** - Browse and view results with a rich terminal interface built with Ratatui
 - **Search highlighting** - Matching search terms are highlighted in yellow bold text
 - **Recent-mail search** - `--this-week` / `--days N` restrict the search to a recent period, skipping most files without reading them. On a 230k-message mailbox this cuts CPU time by roughly 8x. See [Date windows](#date-windows).
+- **Envelope Index pre-filter** - a `--from` search asks Apple Mail's own message database which files are worth opening, instead of reading all of them. On a 230k-message mailbox an unrestricted `--from` search went from 8.8s to 1.5s. Results are identical either way, and a missing or unreadable index just falls back to the full scan. See [Envelope Index](#envelope-index).
 - **Flexible sorting** - Sort results by date (ascending/descending), subject, from, or to fields, interactively or via the `--sort` flag
 - **Machine-readable output** - `--json` prints results to stdout for scripting; `--tsv` prints one TAB-separated line per result for `cut`/`awk`/`column`
 - **Advanced filtering** - Filter results by sender, recipient, subject, date range, or full-text search
@@ -53,6 +54,7 @@ mailsearch [OPTIONS] --from <PATTERN>
 - `-o, --or <TERMS>` - Add an OR group (repeatable). Each group is AND-matched internally, and groups are OR-combined. The whole search still runs in a single scan. Supplies the whole search when no `<QUERY>` is given. See [OR search](#or-search).
 - `--from <PATTERN>` - Only match messages whose `From` header contains PATTERN. Repeatable, and repeats are OR-combined (`--from a --from b` = from either). Matched case-insensitively against the MIME-decoded header, so both the display name and the address work. AND-ed with the query. See [Filters](#filters).
 - `--has-attachment` - Only match messages carrying a real attachment. Embedded images (signature logos and the like) do not count. See [Filters](#filters).
+- `--no-index` - Ignore Apple Mail's Envelope Index and read every message file. An escape hatch; the results are the same either way, only slower. See [Envelope Index](#envelope-index).
 - `-r, --mail-root <DIR>` - Path to Apple Mail directory (default: `~/Library/Mail/V10`)
 - `-l, --limit <N>` - Limit number of results (default: unlimited)
 - `--this-week` - Only search mail from the last 7 days. Shorthand for `--days 7`. See [Date windows](#date-windows).
@@ -192,6 +194,43 @@ it counts as folding whitespace, while a printable separator such as `|` does
 appear in real subjects. Should a value contain a tab anyway, it is replaced
 with a space so the column count stays fixed.
 
+### Envelope Index
+
+Apple Mail keeps a SQLite database at `MailData/Envelope Index` with one row per
+message, including the sender. When a search carries `--from`, that database is
+asked which messages could possibly match, and only those files are opened.
+
+```
+mailsearch --from tezuka        8.8s  ->  1.5s     # 230k-message mailbox
+```
+
+**The index only ever removes candidates.** Every file it keeps is still parsed
+and matched from the `.emlx` itself, so a search returns the same results with
+and without it — `--no-index` is available to confirm that, not to change the
+answer. Two consequences are worth knowing:
+
+- **A missing or unreadable index is not an error.** No Full Disk Access, a
+  locked database, or a schema a future macOS reshapes all fall back to the full
+  scan silently.
+- **Files the index does not know about are kept, never dropped.** Mail leaves
+  `.emlx` files behind that the database no longer references; a real mailbox
+  held 233,847 files against 231,469 indexed messages, and one of those 2,552
+  orphans was a legitimate search hit. Reading them is the floor on how fast an
+  indexed search can be, and the price of never losing a message.
+
+Only `--from` is pushed down to the index. Two filters deliberately are not:
+
+- **`--has-attachment`** — Mail's `attachments` table is a record of what it
+  happened to index, not of which messages have attachments. On a real mailbox
+  32 messages carrying ordinary `.docx`/`.xlsx`/`.pptx` files had no attachment
+  row at all, so requiring one would have silently lost every one of them. Only
+  the MIME walk can answer this.
+- **`--this-week` / `--days N`** — the index stores a received date, which
+  matches neither the `Date:` header the scan compares against nor the file
+  mtime it pre-filters on. Pushing it down would change which messages a window
+  contains rather than merely narrowing the files read. The two mechanisms
+  compose instead: the index picks the senders, the mtime pass picks the window.
+
 ### Duplicate copies
 
 Apple Mail keeps more than one `.emlx` for the same message — adjacent sequence
@@ -258,7 +297,7 @@ If you see permission errors, grant Full Disk Access:
 
 ## How It Works
 
-1. **Discovery** - Recursively finds all `.emlx` files in the mail directory. With `--this-week` / `--days N`, files whose modification time predates the window are dropped here without being read (see [Date windows](#date-windows))
+1. **Discovery** - Recursively finds all `.emlx` files in the mail directory. With `--from`, Apple Mail's Envelope Index is consulted first and files it rules out are dropped before anything else (see [Envelope Index](#envelope-index)). With `--this-week` / `--days N`, files whose modification time predates the window are dropped here without being read (see [Date windows](#date-windows))
 2. **Parsing** - Extracts headers and body content from each email, handling both plain text and HTML. The `Date:` header is resolved first, so mail outside the window is discarded before the expensive body extraction
 3. **Search** - Searches extracted content for the query terms (AND within a group, OR across `--or` groups)
 4. **Display** - Shows results in interactive TUI with highlighted matches
@@ -282,6 +321,7 @@ cargo build --release
 - `mailparse` - `.emlx` / MIME parsing
 - `chrono` - date parsing, formatting, and the `--this-week` / `--days` windows
 - `walkdir` - recursive mail directory traversal
+- `rusqlite` - reads Apple Mail's Envelope Index (bundled SQLite; opened read-only)
 - `ratatui` + `crossterm` - interactive terminal UI
 - `rayon` - parallel search
 - `indicatif` - progress bars and spinners
