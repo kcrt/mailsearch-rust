@@ -429,7 +429,7 @@ cargo build --release
 
 ## TODO
 
-- [ ] Improve search performance further (date windows help a lot, but an unrestricted search still reads every file)
+- [ ] Narrow a text query the way `--from` is narrowed. Date windows and the Envelope Index cover the common cases, but a query with no `--from` and no window still reads every file
 - [ ] Add more sort options (e.g., by attachment count)
 - [ ] Export search results to file
 - [ ] Save and load search queries
