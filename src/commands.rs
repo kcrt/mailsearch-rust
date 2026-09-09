@@ -129,20 +129,42 @@ pub fn dump(path: &Path, headers_only: bool, strip_quotes: bool, prefer_html: bo
     Ok(())
 }
 
+/// One message's attachments as `--json` reports them.
+///
+/// Carries what a follow-up tool needs to act: which file each attachment came
+/// from, where it was written, and — the point of the whole thing — which are
+/// still on the server and therefore need Apple Mail.
+#[derive(serde::Serialize)]
+pub struct AttachmentReport {
+    pub path: String,
+    /// The message's `Message-ID`, so a caller can find it in Apple Mail without
+    /// re-parsing the file.
+    pub message_id: Option<String>,
+    pub attachments: Vec<ReportedAttachment>,
+}
+
+#[derive(serde::Serialize)]
+pub struct ReportedAttachment {
+    #[serde(flatten)]
+    pub attachment: Attachment,
+    /// Where it was written, when `--save` was given and the bytes were on disk.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub saved_to: Option<String>,
+}
+
 /// List a message's attachments, or write them to `save_to`.
 ///
-/// Returns how many were listed or saved, so a caller processing several
-/// messages can report a total.
-pub fn attachments(path: &Path, save_to: Option<&Path>, include_inline: bool) -> Result<usize> {
+/// Returns a report per message; the caller prints it as JSON or as a listing.
+/// Inline parts are dropped here unless asked for, so neither output has to
+/// filter again.
+pub fn attachments(
+    path: &Path,
+    save_to: Option<&Path>,
+    include_inline: bool,
+) -> Result<AttachmentReport> {
     let message = Message::load(path)?;
-    println!(
-        "● {}",
-        path.file_name()
-            .unwrap_or(path.as_os_str())
-            .to_string_lossy()
-    );
 
-    // Listing never decodes: a message with a 30 MB attachment should print its
+    // Listing never decodes: a message with a 30 MB attachment should report its
     // name instantly.
     let entries: Vec<(Attachment, Option<Vec<u8>>)> = match save_to {
         None => message
@@ -153,46 +175,68 @@ pub fn attachments(path: &Path, save_to: Option<&Path>, include_inline: bool) ->
         Some(_) => message.attachment_payloads(),
     };
 
-    let mut count = 0;
-    let mut pending = 0;
+    let mut reported = Vec::new();
     for (attachment, payload) in entries {
         if attachment.inline && !include_inline {
             continue;
         }
-        if !attachment.downloaded {
-            pending += 1;
-        }
-        let Some(directory) = save_to else {
-            println!("{}", attachment_line(&attachment));
-            count += 1;
-            continue;
+        let saved_to = match (save_to, payload) {
+            (Some(directory), Some(bytes)) => {
+                let target = unique_path(directory, &safe_file_name(&attachment.name));
+                std::fs::write(&target, bytes)
+                    .with_context(|| format!("cannot write {}", target.display()))?;
+                Some(target.display().to_string())
+            }
+            // Either a plain listing, or a part whose bytes are on the server.
+            _ => None,
         };
-        let Some(bytes) = payload else {
-            eprintln!("  [skipped] {} — not downloaded", attachment.name);
-            continue;
-        };
-        let target = unique_path(directory, &safe_file_name(&attachment.name));
-        let written = bytes.len();
-        std::fs::write(&target, bytes)
-            .with_context(|| format!("cannot write {}", target.display()))?;
-        println!(
-            "  saved: {}  ({} bytes)",
-            target.display(),
-            thousands(written)
-        );
-        count += 1;
+        reported.push(ReportedAttachment {
+            attachment,
+            saved_to,
+        });
     }
 
+    Ok(AttachmentReport {
+        path: path.display().to_string(),
+        message_id: crate::email::extract_message_id(&message.parsed()),
+        attachments: reported,
+    })
+}
+
+/// Print an attachment report the way a person reads it.
+pub fn print_attachment_report(report: &AttachmentReport, saving: bool) {
+    let path = Path::new(&report.path);
+    println!(
+        "● {}",
+        path.file_name()
+            .unwrap_or(path.as_os_str())
+            .to_string_lossy()
+    );
+    let mut pending = 0;
+    for reported in &report.attachments {
+        if !reported.attachment.downloaded {
+            pending += 1;
+        }
+        match &reported.saved_to {
+            Some(target) => println!(
+                "  saved: {target}  ({} bytes)",
+                thousands(reported.attachment.size.unwrap_or(0))
+            ),
+            None if saving => {
+                eprintln!("  [skipped] {} — not downloaded", reported.attachment.name)
+            }
+            None => println!("{}", attachment_line(&reported.attachment)),
+        }
+    }
     if pending > 0 {
         eprintln!(
             "  {pending} attachment(s) are still on the server. \
              Apple Mail has to fetch those; this tool does not drive it."
         );
     }
-    if count == 0 && pending == 0 {
+    if report.attachments.is_empty() {
         eprintln!("  no attachments");
     }
-    Ok(count)
 }
 
 /// Reduce a sender-supplied filename to something safe to write.

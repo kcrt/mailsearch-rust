@@ -86,6 +86,12 @@ pub struct AttachmentArgs {
     /// Include embedded parts (signature images and the like)
     #[arg(long = "include-inline", default_value_t = false)]
     pub include_inline: bool,
+
+    /// Print a JSON array to stdout instead of a human-readable listing
+    // What lets another tool act on the result — in particular, fetch the parts
+    // this one reports as still being on the server.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
 }
 
 /// Configuration for the search operation.

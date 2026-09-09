@@ -31,7 +31,7 @@ const APPLE_CONTENT_LENGTH: &str = "X-Apple-Content-Length";
 const DISPLAY_HEADERS: [&str; 6] = ["Date", "From", "To", "Cc", "Subject", "Message-ID"];
 
 /// One attachment, as described by the message structure alone.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Attachment {
     pub name: String,
     pub mimetype: String,

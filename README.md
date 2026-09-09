@@ -128,6 +128,11 @@ extraction, which flattens whitespace because it only has to match a query.
 - `--html` - convert the HTML part even when a plain one exists
 
 `attachments` lists them by default, or writes them out with `--save DIR`.
+`--json` prints the same information for another tool to act on: each entry
+carries the message's `path` and `message_id`, and each attachment its `name`,
+`mimetype`, `size`, `inline`, `downloaded`, and `saved_to` where one was written.
+That is what lets a wrapper pick up the parts reported as `"downloaded": false`
+and go and fetch them.
 Existing files are never overwritten (`report.pdf`, `report_2.pdf`, …), and a
 sender-supplied name cannot choose where the file lands. Embedded parts
 (signature images) are skipped unless `--include-inline` is given.

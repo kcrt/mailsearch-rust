@@ -116,21 +116,29 @@ fn run_command(command: &Command) -> Result<()> {
                 }
             }
             let (paths, mut failed) = resolve_targets(&args.target);
-            let mut total = 0;
+            let mut reports = Vec::new();
             for path in &paths {
                 match commands::attachments(path, args.save.as_deref(), args.include_inline) {
-                    Ok(count) => total += count,
+                    Ok(report) => reports.push(report),
                     Err(error) => {
                         eprintln!("{error:#}");
                         failed = true;
                     }
                 }
             }
-            // Only for a multi-message run, where the per-message lines scroll
-            // away and the total is the part worth reading.
-            if args.target.targets.len() > 1 {
-                let verb = if args.save.is_some() { "saved" } else { "listed" };
-                println!("\n{verb}: {total}");
+            if args.json {
+                println!("{}", serde_json::to_string_pretty(&reports)?);
+            } else {
+                for report in &reports {
+                    commands::print_attachment_report(report, args.save.is_some());
+                }
+                // Only for a multi-message run, where the per-message lines
+                // scroll away and the total is the part worth reading.
+                if args.target.targets.len() > 1 {
+                    let total: usize = reports.iter().map(|r| r.attachments.len()).sum();
+                    let verb = if args.save.is_some() { "saved" } else { "listed" };
+                    println!("\n{verb}: {total}");
+                }
             }
             failed
         }
