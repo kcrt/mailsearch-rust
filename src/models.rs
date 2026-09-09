@@ -51,6 +51,23 @@ pub struct Filters {
     /// Require at least one real attachment. Inline parts (signature images and
     /// the like) do not count.
     pub require_attachment: bool,
+    /// Match only the message with exactly this `Message-ID`, angle brackets
+    /// stripped. `None` = no restriction.
+    ///
+    /// Kept as a filter rather than folded into the text query because
+    /// `Message-ID` is not among the headers a query is matched against, and
+    /// because a reply quoting the id in its body must not count as the message.
+    /// Checked before the body is extracted, so a lookup reads headers only.
+    pub message_id: Option<String>,
+}
+
+/// A `Message-ID` without its angle brackets, so `<a@b>` and `a@b` compare equal.
+pub fn normalise_message_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string()
 }
 
 // Default Mail directory

@@ -210,6 +210,7 @@ mod tests {
         Filters {
             from_patterns: from.iter().map(|s| s.to_string()).collect(),
             require_attachment: attachment,
+            ..Filters::default()
         }
     }
 

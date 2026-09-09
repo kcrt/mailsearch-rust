@@ -74,14 +74,22 @@ pub fn date_display(timestamp: Option<i64>, raw_header: Option<&str>) -> String 
         .unwrap_or_else(|| "N/A".to_string())
 }
 
+/// Remove the parts of an HTML document that carry no readable text: style and
+/// script blocks together with their contents, and comments.
+///
+/// Split out from [`strip_html_tags`] so the display-oriented conversion in
+/// [`crate::message`] can reuse it without also inheriting the whitespace
+/// collapsing below — which is right for matching a query against a body and
+/// wrong for showing that body to a person.
+pub fn strip_html_blocks(html: &str) -> String {
+    let text = style_block_regex().replace_all(html, " ");
+    let text = script_block_regex().replace_all(&text, " ");
+    html_comment_regex().replace_all(&text, " ").into_owned()
+}
+
 /// Remove HTML tags, CSS, scripts, and normalize whitespace.
 pub fn strip_html_tags(html: &str) -> String {
-    // Remove style blocks
-    let text = style_block_regex().replace_all(html, " ");
-    // Remove script blocks
-    let text = script_block_regex().replace_all(&text, " ");
-    // Remove HTML comments
-    let text = html_comment_regex().replace_all(&text, " ");
+    let text = strip_html_blocks(html);
     // Remove remaining HTML tags
     let text = html_tag_regex().replace_all(&text, " ");
     // Normalize whitespace
@@ -333,7 +341,7 @@ pub struct Criteria<'a> {
 /// A length that is missing, unparsable, or longer than the file falls back to
 /// "everything after the first line", which is what this did before: a wrong
 /// length should cost the old rubbish, not the whole message.
-fn rfc822_slice(bytes: &[u8]) -> Option<&[u8]> {
+pub fn rfc822_slice(bytes: &[u8]) -> Option<&[u8]> {
     // `position(..)? + 1` also guards a truncated file with no newline at all,
     // and yields an empty slice when the newline is the final byte.
     let mime_start = bytes.iter().position(|&b| b == b'\n')? + 1;
@@ -381,6 +389,12 @@ pub fn process_emlx_file(
     // read headers, while the body extraction decodes charsets and strips HTML.
     if !matches_from(&mail, &criteria.filters.from_patterns) {
         return None;
+    }
+    if let Some(wanted) = &criteria.filters.message_id {
+        let found = extract_message_id(&mail).map(|id| crate::models::normalise_message_id(&id));
+        if found.as_deref() != Some(wanted.as_str()) {
+            return None;
+        }
     }
     if criteria.filters.require_attachment && !has_attachment(&mail) {
         return None;
@@ -1181,7 +1195,7 @@ mod tests {
         let path = dir.path().join("blank_id.emlx");
         std::fs::write(
             &path,
-            &emlx("From: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n"),
+            emlx("From: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n"),
         )
         .unwrap();
 
@@ -1231,7 +1245,7 @@ mod tests {
         // Byte-count line, then a message with no Date: header at all.
         std::fs::write(
             &path,
-            &emlx("From: sender@example.com\nSubject: No date here\n\nquarterly report body\n"),
+            emlx("From: sender@example.com\nSubject: No date here\n\nquarterly report body\n"),
         )
         .unwrap();
 

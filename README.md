@@ -39,6 +39,9 @@ The release binary will be at `target/release/mailsearch`.
 mailsearch [OPTIONS] <QUERY>
 mailsearch [OPTIONS] --or <TERMS>...
 mailsearch [OPTIONS] --from <PATTERN>
+
+mailsearch dump [OPTIONS] <TARGET>...          # print a message as text
+mailsearch attachments [OPTIONS] <TARGET>...   # list or save its attachments
 ```
 
 ### Arguments
@@ -95,6 +98,72 @@ Search only recent mail (much faster on a large mailbox):
 mailsearch --this-week meeting
 mailsearch --days 30 --sort date-desc invoice
 ```
+
+### Working with a message you found
+
+Searching tells you *which* message; `dump` and `attachments` are for reading it
+and getting files out of it. Both take the same kind of `<TARGET>` — an `.emlx`
+path or a `Message-ID` — so a search pipes straight into either:
+
+```bash
+# Read the most recent message from this sender
+mailsearch --tsv --days 7 --from yamada | head -1 | cut -f5 | xargs mailsearch dump
+
+# Save every attachment from this week's mail into ~/Inbox
+mailsearch --tsv --this-week --from yamada --has-attachment | cut -f5 \
+  | xargs mailsearch attachments --save ~/Inbox
+
+# By Message-ID, brackets optional
+mailsearch dump --days 30 '<TY0PR01MB0000ABCD@TY0PR01MB0000.prod.outlook.com>'
+```
+
+`dump` prints the headers, the attachment list, and the body. It prefers the
+`text/plain` part and leaves its line breaks alone — unlike the search path's
+extraction, which flattens whitespace because it only has to match a query.
+
+- `--headers-only` - headers and attachment list, no body
+- `--strip-quote` - drop the quoted reply and the signature
+- `--html` - convert the HTML part even when a plain one exists
+
+`attachments` lists them by default, or writes them out with `--save DIR`.
+Existing files are never overwritten (`report.pdf`, `report_2.pdf`, …), and a
+sender-supplied name cannot choose where the file lands. Embedded parts
+(signature images) are skipped unless `--include-inline` is given.
+
+Both accept `--days N`, which only matters when a `Message-ID` has to be looked
+up: the Envelope Index stores a hash of the id rather than the id itself, so
+that lookup scans, and a window is the difference between reading a few thousand
+files and a quarter of a million.
+
+**Neither ever asks Apple Mail for anything.** That keeps them fast and keeps
+Mail's interface responsive, but it also means content Mail has not downloaded
+is not there to read. Such attachments are listed with their real name and size
+and marked `NOT DOWNLOADED` rather than reported as empty:
+
+```
+● 964173.partial.emlx
+  外部260417 鈴木一郎.zip  (application/x-zip-compressed, 3,265,430 bytes, NOT DOWNLOADED)
+```
+
+Fetching them is Apple Mail's job, and driving Mail is deliberately left to a
+separate tool.
+
+### Attachment filenames
+
+Attachment names come back decoded, which is more work than it sounds. Japanese
+mail from Outlook writes them in three shapes, and the last two are both
+non-standard:
+
+- a plain `filename="report.pdf"`;
+- an RFC 2047 encoded word inside a quoted string, which RFC 2047 does not
+  permit but Outlook emits anyway;
+- that encoded word split across RFC 2231 continuations (`filename*0`,
+  `filename*1`, …) **mid-base64**, so the segments have to be joined before
+  anything can be decoded.
+
+On top of that the charset is usually ISO-2022-JP carrying NEC/IBM extension
+characters — `①`, `㈱`, `髙` — which most decoders cannot represent. Names like
+`新規260415 倫2026-001 山田太郎(迅速)学会.zip` survive all of it intact.
 
 ### Date windows
 
