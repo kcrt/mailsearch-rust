@@ -51,6 +51,31 @@ pub struct Filters {
     /// Require at least one real attachment. Inline parts (signature images and
     /// the like) do not count.
     pub require_attachment: bool,
+    /// Lowercased patterns matched against attachment filenames; a message
+    /// passes when **any** attachment name contains **any** of them. Empty = no
+    /// filter.
+    ///
+    /// Not pushed down to the Envelope Index even though it holds attachment
+    /// names, for the same reason `require_attachment` is not: that table is
+    /// incomplete. See [`crate::index`].
+    pub attachment_names: Vec<String>,
+    /// Match only the message with exactly this `Message-ID`, angle brackets
+    /// stripped. `None` = no restriction.
+    ///
+    /// Kept as a filter rather than folded into the text query because
+    /// `Message-ID` is not among the headers a query is matched against, and
+    /// because a reply quoting the id in its body must not count as the message.
+    /// Checked before the body is extracted, so a lookup reads headers only.
+    pub message_id: Option<String>,
+}
+
+/// A `Message-ID` without its angle brackets, so `<a@b>` and `a@b` compare equal.
+pub fn normalise_message_id(value: &str) -> String {
+    value
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .to_string()
 }
 
 // Default Mail directory

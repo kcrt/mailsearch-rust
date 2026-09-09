@@ -74,18 +74,29 @@ pub fn date_display(timestamp: Option<i64>, raw_header: Option<&str>) -> String 
         .unwrap_or_else(|| "N/A".to_string())
 }
 
+/// Remove the parts of an HTML document that carry no readable text: style and
+/// script blocks together with their contents, and comments.
+///
+/// Split out from [`strip_html_tags`] so the display-oriented conversion in
+/// [`crate::message`] can reuse it without also inheriting the whitespace
+/// collapsing below — which is right for matching a query against a body and
+/// wrong for showing that body to a person.
+pub fn strip_html_blocks(html: &str) -> String {
+    let text = style_block_regex().replace_all(html, " ");
+    let text = script_block_regex().replace_all(&text, " ");
+    html_comment_regex().replace_all(&text, " ").into_owned()
+}
+
 /// Remove HTML tags, CSS, scripts, and normalize whitespace.
 pub fn strip_html_tags(html: &str) -> String {
-    // Remove style blocks
-    let text = style_block_regex().replace_all(html, " ");
-    // Remove script blocks
-    let text = script_block_regex().replace_all(&text, " ");
-    // Remove HTML comments
-    let text = html_comment_regex().replace_all(&text, " ");
+    let text = strip_html_blocks(html);
     // Remove remaining HTML tags
     let text = html_tag_regex().replace_all(&text, " ");
     // Normalize whitespace
-    whitespace_regex().replace_all(&text, " ").trim().to_string()
+    whitespace_regex()
+        .replace_all(&text, " ")
+        .trim()
+        .to_string()
 }
 
 /// Clean embedded newlines from header values.
@@ -241,16 +252,27 @@ pub fn matches_from(mail: &mailparse::ParsedMail<'_>, patterns: &[String]) -> bo
 ///   as embedded rather than attached.
 ///
 /// An explicit `attachment` disposition always wins, `Content-ID` or not: if the
-/// sender declared it an attachment, it is one.
+/// sender declared it an attachment, it is one — with the single exception of a
+/// cryptographic signature; see [`is_detached_signature`].
 fn part_is_attachment(part: &mailparse::ParsedMail<'_>) -> bool {
     if part.ctype.mimetype.to_lowercase().starts_with("multipart/") {
         return false;
     }
+    if is_detached_signature(&part.ctype.mimetype) {
+        return false;
+    }
     let disposition = part.get_content_disposition();
-    if matches!(disposition.disposition, mailparse::DispositionType::Attachment) {
+    if matches!(
+        disposition.disposition,
+        mailparse::DispositionType::Attachment
+    ) {
         return true;
     }
-    if part.headers.get_first_header("Content-Disposition").is_some() {
+    if part
+        .headers
+        .get_first_header("Content-Disposition")
+        .is_some()
+    {
         // Explicitly inline (or form-data/extension): not an attachment.
         return false;
     }
@@ -259,6 +281,62 @@ fn part_is_attachment(part: &mailparse::ParsedMail<'_>) -> bool {
         return false;
     }
     disposition.params.contains_key("filename") || part.ctype.params.contains_key("name")
+}
+
+/// Whether a MIME type is a detached cryptographic signature.
+///
+/// S/MIME/PGP signed mail carries the signature as a sibling part declared
+/// `Content-Disposition: attachment` with a filename (`smime.p7s`,
+/// `signature.asc`), which is indistinguishable from a real attachment by
+/// structure alone. Nobody asking for "mail with an attachment" means a signed
+/// bank notification, and Apple Mail agrees: it does not list these as
+/// attachments either. Measured on real mail, they were **83 of the 831**
+/// messages `--has-attachment` returned over 90 days.
+///
+/// Only *detached* signatures are excluded. `application/pkcs7-mime` — signed or
+/// encrypted content rather than a signature over it — can carry the real
+/// message and its attachments, so it is left alone.
+fn is_detached_signature(mimetype: &str) -> bool {
+    matches!(
+        mimetype.to_lowercase().as_str(),
+        "application/pkcs7-signature"
+            | "application/x-pkcs7-signature"
+            | "application/pgp-signature"
+    )
+}
+
+/// Every real attachment's filename, lowercased for matching.
+///
+/// Uses the same notion of "real" as [`has_attachment`], so `--attachment-name`
+/// and `--has-attachment` cannot disagree about what a message contains.
+fn attachment_names(mail: &mailparse::ParsedMail<'_>, out: &mut Vec<String>) {
+    if part_is_attachment(mail) {
+        let disposition = mail.get_content_disposition();
+        if let Some(name) = disposition
+            .params
+            .get("filename")
+            .or_else(|| mail.ctype.params.get("name"))
+        {
+            out.push(crate::message::decode_encoded_words(name).to_lowercase());
+        }
+    }
+    for subpart in &mail.subparts {
+        attachment_names(subpart, out);
+    }
+}
+
+/// Whether any attachment's name contains any of `patterns`.
+///
+/// Patterns are expected to arrive lowercased, as the names are lowercased here.
+pub fn matches_attachment_name(mail: &mailparse::ParsedMail<'_>, patterns: &[String]) -> bool {
+    if patterns.is_empty() {
+        return true;
+    }
+    let mut names = Vec::new();
+    attachment_names(mail, &mut names);
+    names
+        .iter()
+        .any(|name| patterns.iter().any(|pattern| name.contains(pattern)))
 }
 
 /// Whether a message carries at least one real attachment.
@@ -286,6 +364,41 @@ pub struct Criteria<'a> {
     pub filters: &'a crate::models::Filters,
 }
 
+/// The RFC 822 message inside an `.emlx` file.
+///
+/// An `.emlx` is three parts: a first line giving the message length in bytes,
+/// the message itself, and an Apple property list of Mail's own metadata. Every
+/// file has the trailing plist — all 233,847 of them on a real mailbox — so
+/// **dropping the first line is not enough**; the length has to be used.
+///
+/// Getting this wrong is easy to miss. In a multipart message the plist lands
+/// after the closing boundary, where the parser ignores it. In a single-part
+/// message it lands *inside the body*, and for the `Content-Transfer-Encoding:
+/// base64` that Apple Mail uses for its own outgoing mail it is decoded along
+/// with the message, appending binary rubbish to the text:
+///
+/// ```text
+/// 2026年3月28日 9:00: みどり中央クリニック          <- the message
+/// 2026年3月28日 9:00: みどり中央クリニック1[ޮȨ]... <- without the length
+/// ```
+///
+/// A length that is missing, unparsable, or longer than the file falls back to
+/// "everything after the first line", which is what this did before: a wrong
+/// length should cost the old rubbish, not the whole message.
+pub fn rfc822_slice(bytes: &[u8]) -> Option<&[u8]> {
+    // `position(..)? + 1` also guards a truncated file with no newline at all,
+    // and yields an empty slice when the newline is the final byte.
+    let mime_start = bytes.iter().position(|&b| b == b'\n')? + 1;
+    let rest = &bytes[mime_start..];
+    let length = std::str::from_utf8(&bytes[..mime_start])
+        .ok()
+        .and_then(|line| line.trim().parse::<usize>().ok());
+    Some(match length {
+        Some(length) if length <= rest.len() => &rest[..length],
+        _ => rest,
+    })
+}
+
 /// Process a single .emlx file and return SearchResult if it matches the criteria.
 ///
 /// `mtime` is the file's modification time in epoch seconds when it was already
@@ -300,16 +413,8 @@ pub fn process_emlx_file(
     // decoding is `mailparse`'s job anyway (`get_body` honours the charset).
     let bytes = std::fs::read(path).ok()?;
 
-    // .emlx format:
-    // Line 1: Byte count
-    // Line 2+: MIME content
-    //
-    // `position(..)? + 1` also guards a truncated file with no newline at all,
-    // and yields an empty slice when the newline is the final byte.
-    let mime_start = bytes.iter().position(|&b| b == b'\n')? + 1;
-
     // Parse as email
-    let mail = mailparse::parse_mail(&bytes[mime_start..]).ok()?;
+    let mail = mailparse::parse_mail(rfc822_slice(&bytes)?).ok()?;
 
     // Resolve the date first: it is cheap, and lets a message outside the window
     // be rejected before the expensive body extraction and HTML stripping.
@@ -329,7 +434,16 @@ pub fn process_emlx_file(
     if !matches_from(&mail, &criteria.filters.from_patterns) {
         return None;
     }
+    if let Some(wanted) = &criteria.filters.message_id {
+        let found = extract_message_id(&mail).map(|id| crate::models::normalise_message_id(&id));
+        if found.as_deref() != Some(wanted.as_str()) {
+            return None;
+        }
+    }
     if criteria.filters.require_attachment && !has_attachment(&mail) {
+        return None;
+    }
+    if !matches_attachment_name(&mail, &criteria.filters.attachment_names) {
         return None;
     }
 
@@ -410,12 +524,18 @@ mod tests {
     #[test]
     fn from_patterns_are_or_combined() {
         let msg = mail("From: b@example.com\n\nbody");
-        assert!(matches_from(&msg, &patterns(&["a@example.com", "b@example.com"])));
+        assert!(matches_from(
+            &msg,
+            &patterns(&["a@example.com", "b@example.com"])
+        ));
     }
 
     #[test]
     fn a_message_without_a_from_header_matches_no_pattern() {
-        assert!(!matches_from(&mail("Subject: x\n\nbody"), &patterns(&["a"])));
+        assert!(!matches_from(
+            &mail("Subject: x\n\nbody"),
+            &patterns(&["a"])
+        ));
     }
 
     #[test]
@@ -483,6 +603,208 @@ mod tests {
             "--b\nContent-Type: image/png; name=\"chart.png\"\n",
             "Content-ID: <chart@example.com>\n",
             "Content-Disposition: attachment; filename=\"chart.png\"\n\niVBOR\n",
+            "--b--\n"
+        ))));
+    }
+
+    // ========== rfc822_slice tests ==========
+
+    /// An `.emlx` as Mail writes it, without the plist: length line, message.
+    ///
+    /// The count has to be right — [`rfc822_slice`] slices by it, so a
+    /// placeholder would truncate the fixture rather than the plist.
+    fn emlx(message: &str) -> String {
+        format!("{}\n{message}", message.len())
+    }
+
+    /// The same, with the trailing Apple plist every real `.emlx` carries.
+    fn emlx_with_plist(message: &str) -> Vec<u8> {
+        let plist = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<plist><dict/></plist>\n";
+        format!("{}\n{message}{plist}", message.len()).into_bytes()
+    }
+
+    #[test]
+    fn the_trailing_plist_is_cut_off() {
+        let raw = emlx_with_plist("Subject: hi\n\nbody\n");
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
+    }
+
+    #[test]
+    fn a_single_part_body_does_not_swallow_the_plist() {
+        // The case that appended binary rubbish to Apple Mail's own sent mail.
+        let raw = emlx_with_plist("Content-Type: text/plain\n\nhello\n");
+        let mail = mailparse::parse_mail(rfc822_slice(&raw).unwrap()).unwrap();
+        assert_eq!(extract_email_text(&mail).trim(), "hello");
+    }
+
+    #[test]
+    fn a_missing_length_falls_back_to_everything_after_the_first_line() {
+        // A plain `.eml` handed to the tool, or a file whose first line is not a
+        // number: keep the old behaviour rather than losing the message.
+        let raw = b"Subject: hi\n\nbody\n".to_vec();
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"\nbody\n");
+    }
+
+    #[test]
+    fn a_length_longer_than_the_file_falls_back() {
+        let raw = b"99999\nSubject: hi\n\nbody\n".to_vec();
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
+    }
+
+    #[test]
+    fn a_file_with_no_newline_at_all_is_rejected() {
+        assert!(rfc822_slice(b"12345").is_none());
+    }
+
+    #[test]
+    fn a_length_line_ending_in_crlf_still_parses() {
+        // "Subject: hi\n\nbody\n" is 18 bytes; the trailing text stands in for
+        // the plist and must be cut off despite the \r before the newline.
+        let raw = b"18\r\nSubject: hi\n\nbody\nTRAILING".to_vec();
+        assert_eq!(rfc822_slice(&raw).unwrap(), b"Subject: hi\n\nbody\n");
+    }
+
+    // ========== matches_attachment_name ==========
+
+    #[test]
+    fn an_attachment_name_pattern_matches_a_substring() {
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"2026 report final.pdf\"\n\nJVBER\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(&m, &["report".to_string()]));
+        assert!(!matches_attachment_name(&m, &["invoice".to_string()]));
+    }
+
+    #[test]
+    fn no_attachment_name_pattern_matches_everything() {
+        let m = mail("Content-Type: text/plain\n\nbody\n");
+        assert!(matches_attachment_name(&m, &[]));
+    }
+
+    #[test]
+    fn an_attachment_name_pattern_is_case_insensitive_for_ascii() {
+        // Patterns arrive lowercased from `Config::filters`.
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"Report.PDF\"\n\nJVBER\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(&m, &["report.pdf".to_string()]));
+    }
+
+    #[test]
+    fn repeated_attachment_name_patterns_are_or_combined() {
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pdf\n",
+            "Content-Disposition: attachment; filename=\"report.pdf\"\n\nJVBER\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(
+            &m,
+            &["invoice".to_string(), "report".to_string()]
+        ));
+    }
+
+    #[test]
+    fn a_signature_image_name_is_not_matchable() {
+        // Otherwise `--attachment-name image001` would hit half the mailbox.
+        let m = mail(concat!(
+            "Content-Type: multipart/related; boundary=b\n\n",
+            "--b\nContent-Type: text/html\n\n<img src=\"cid:i\">\n",
+            "--b\nContent-Type: image/png; name=\"image001.png\"\n",
+            "Content-ID: <i>\n\niVBOR\n",
+            "--b--\n"
+        ));
+        assert!(!matches_attachment_name(&m, &["image001".to_string()]));
+    }
+
+    #[test]
+    fn a_japanese_attachment_name_is_matchable() {
+        // The name arrives RFC 2047 encoded and must be decoded before matching,
+        // or a search for the case number could never hit.
+        let m = mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/x-zip-compressed\n",
+            "Content-Disposition: attachment;\n",
+            "\tfilename*0=\"=?iso-2022-jp?B?GyRCPzc1LBsoQjI2MDQxNSAbJEJOURsoQjIwMjYtMDAxIBsk\";\n",
+            "\tfilename*1=\"QjszGyhC?=  =?iso-2022-jp?B?GyRCRURCQE86GyhCKBskQj9XQi4bKEIpGyRC\";\n",
+            "\tfilename*2=\"M1gycRsoQi56aXA=?=\"\n\nUEsD\n",
+            "--b--\n"
+        ));
+        assert!(matches_attachment_name(&m, &["倫2026-001".to_string()]));
+        assert!(matches_attachment_name(&m, &["山田".to_string()]));
+    }
+
+    #[test]
+    fn an_smime_signature_is_not_an_attachment() {
+        // The shape every signed bank notification arrives in: a plain body plus
+        // a detached signature declared as an attachment. 83 of 831 hits.
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/x-pkcs7-signature; name=\"smime.p7s\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7s\"\n\nMIIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn the_unprefixed_smime_signature_type_is_also_excluded() {
+        // Both spellings occur in the wild, 19 and 64 times respectively.
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7s\"\n\nMIIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_pgp_signature_is_not_an_attachment() {
+        assert!(!has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pgp-signature; name=\"signature.asc\"\n",
+            "Content-Disposition: attachment; filename=\"signature.asc\"\n\n-----BEGIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn a_real_attachment_alongside_a_signature_still_counts() {
+        // Signed mail that also carries a document must not be filtered out.
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/signed; boundary=b\n\n",
+            "--b\nContent-Type: multipart/mixed; boundary=c\n\n",
+            "--c\nContent-Type: text/plain\n\nbody\n",
+            "--c\nContent-Type: application/pdf; name=\"report.pdf\"\n",
+            "Content-Disposition: attachment; filename=\"report.pdf\"\n\nJVBER\n",
+            "--c--\n",
+            "--b\nContent-Type: application/pkcs7-signature; name=\"smime.p7s\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7s\"\n\nMIIN\n",
+            "--b--\n"
+        ))));
+    }
+
+    #[test]
+    fn signed_or_encrypted_content_is_not_treated_as_a_signature() {
+        // `pkcs7-mime` wraps the real message, attachments and all, so excluding
+        // it would hide genuine attachments rather than signature noise.
+        assert!(has_attachment(&mail(concat!(
+            "Content-Type: multipart/mixed; boundary=b\n\n",
+            "--b\nContent-Type: text/plain\n\nbody\n",
+            "--b\nContent-Type: application/pkcs7-mime; name=\"smime.p7m\"\n",
+            "Content-Disposition: attachment; filename=\"smime.p7m\"\n\nMIIN\n",
             "--b--\n"
         ))));
     }
@@ -556,8 +878,14 @@ mod tests {
     #[test]
     fn test_matches_query_multiple_terms_and_logic() {
         // All terms must be present (AND logic)
-        assert!(matches_query("rust programming language", &q("rust language")));
-        assert!(matches_query("rust programming language", &q("rust programming")));
+        assert!(matches_query(
+            "rust programming language",
+            &q("rust language")
+        ));
+        assert!(matches_query(
+            "rust programming language",
+            &q("rust programming")
+        ));
         assert!(!matches_query("rust programming", &q("rust java")));
         assert!(!matches_query("rust", &q("rust java")));
     }
@@ -796,7 +1124,6 @@ mod tests {
         );
     }
 
-
     // ========== process_emlx_file integration tests ==========
 
     #[test]
@@ -809,11 +1136,18 @@ mod tests {
 
         let result = scan(&path, "rust programming");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         assert_eq!(search_result.subject, "Test Plain Text Email");
         assert!(search_result.from_addr.contains("sender@example.com"));
         assert!(search_result.content.contains("rust programming"));
+        // The fixture carries the trailing Apple plist every real `.emlx` has.
+        // Slicing by the length line is what keeps it out of the body.
+        assert!(
+            !search_result.content.contains("plist"),
+            "the trailing plist leaked into the body: {}",
+            search_result.content
+        );
     }
 
     #[test]
@@ -825,7 +1159,7 @@ mod tests {
 
         let result = scan(&path, "invoice receipt");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         assert_eq!(search_result.subject, "HTML Test Email");
         // HTML tags should be stripped
@@ -843,7 +1177,7 @@ mod tests {
 
         let result = scan(&path, "project update");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         assert_eq!(search_result.subject, "Multipart Email Test");
         assert!(search_result.content.contains("project update"));
@@ -858,7 +1192,7 @@ mod tests {
 
         let result = scan(&path, "without");
         assert!(result.is_some());
-        
+
         let search_result = result.unwrap();
         // Should use NO_SUBJECT constant
         assert!(search_result.subject.contains("No Subject") || search_result.subject.is_empty());
@@ -999,7 +1333,7 @@ mod tests {
         let path = dir.path().join("blank_id.emlx");
         std::fs::write(
             &path,
-            "42\nFrom: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n",
+            emlx("From: sender@example.com\nSubject: Blank\nMessage-ID:   \n\nbody text here\n"),
         )
         .unwrap();
 
@@ -1049,7 +1383,7 @@ mod tests {
         // Byte-count line, then a message with no Date: header at all.
         std::fs::write(
             &path,
-            "42\nFrom: sender@example.com\nSubject: No date here\n\nquarterly report body\n",
+            emlx("From: sender@example.com\nSubject: No date here\n\nquarterly report body\n"),
         )
         .unwrap();
 
@@ -1097,6 +1431,9 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
 
         let result = scan(&path, "会議");
-        assert!(result.is_some(), "Shift_JIS body should be decoded and matched");
+        assert!(
+            result.is_some(),
+            "Shift_JIS body should be decoded and matched"
+        );
     }
 }

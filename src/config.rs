@@ -5,9 +5,97 @@ use crate::models::{Filters, DEFAULT_LIMIT, DEFAULT_MAIL_ROOT};
 use crate::sort::SortMode;
 use std::path::PathBuf;
 
-/// Configuration for the search operation.
+/// The whole command line: a search by default, or one of the subcommands.
+///
+/// `subcommand_negates_reqs` is what lets the search keep its bare positional
+/// query while subcommands exist alongside it — without it, `mailsearch dump …`
+/// would be rejected for not supplying a QUERY.
+///
+/// ⚠️ The cost of a bare positional is that a subcommand name cannot also be
+/// searched for: `mailsearch dump` runs the subcommand. Search for the word
+/// with `--or dump`.
 #[derive(Debug, Clone, Parser)]
 #[command(author, version, about, long_about = None)]
+#[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
+pub struct Cli {
+    #[command(subcommand)]
+    pub command: Option<Command>,
+
+    #[command(flatten)]
+    pub search: Config,
+}
+
+/// Things to do with a message already found, as opposed to finding one.
+#[derive(Debug, Clone, clap::Subcommand)]
+pub enum Command {
+    /// Print a message as text: headers, attachment list, body
+    Dump(DumpArgs),
+    /// List a message's attachments, or save them to a directory
+    Attachments(AttachmentArgs),
+}
+
+/// Where a subcommand looks for the message(s) it was given.
+///
+/// Flattened into both subcommands so they take targets the same way, and so a
+/// search's `--tsv` output pipes into either without adjustment.
+#[derive(Debug, Clone, clap::Args)]
+pub struct TargetArgs {
+    /// Path to an `.emlx` file, or a Message-ID (angle brackets optional)
+    #[arg(num_args = 1.., value_name = "TARGET")]
+    pub targets: Vec<String>,
+
+    /// Path to Apple Mail directory, used when a Message-ID has to be looked up
+    #[arg(short = 'r', long = "mail-root", default_value = DEFAULT_MAIL_ROOT)]
+    pub mail_root: PathBuf,
+
+    /// When looking up a Message-ID, only scan mail from the last N days
+    // A Message-ID cannot be looked up in the Envelope Index — it stores a hash
+    // of the id, not the id — so the lookup scans. This is the difference
+    // between reading a few thousand files and a quarter of a million.
+    #[arg(long = "days", value_name = "N", value_parser = clap::value_parser!(u32).range(0..=MAX_DAYS))]
+    pub days: Option<u32>,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct DumpArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    /// Print the headers and attachment list, but not the body
+    #[arg(long = "headers-only", default_value_t = false)]
+    pub headers_only: bool,
+
+    /// Drop the quoted reply and the signature, leaving what this sender wrote
+    #[arg(long = "strip-quote", default_value_t = false)]
+    pub strip_quote: bool,
+
+    /// Convert the HTML part even when a plain text one exists
+    #[arg(long = "html", default_value_t = false)]
+    pub html: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct AttachmentArgs {
+    #[command(flatten)]
+    pub target: TargetArgs,
+
+    /// Write the attachments into this directory instead of listing them
+    #[arg(long = "save", value_name = "DIR")]
+    pub save: Option<PathBuf>,
+
+    /// Include embedded parts (signature images and the like)
+    #[arg(long = "include-inline", default_value_t = false)]
+    pub include_inline: bool,
+
+    /// Print a JSON array to stdout instead of a human-readable listing
+    // What lets another tool act on the result — in particular, fetch the parts
+    // this one reports as still being on the server.
+    #[arg(long = "json", default_value_t = false)]
+    pub json: bool,
+}
+
+/// Configuration for the search operation.
+#[derive(Debug, Clone, clap::Args)]
 pub struct Config {
     /// Search query (multiple words = AND search; use --or for OR groups)
     // Taken as a list so the words may be quoted as one argument or left bare:
@@ -28,7 +116,7 @@ pub struct Config {
     #[arg(
         num_args = 1..,
         value_name = "QUERY",
-        required_unless_present_any = ["or_terms", "from", "has_attachment"]
+        required_unless_present_any = ["or_terms", "from", "has_attachment", "attachment_name"]
     )]
     pub query: Vec<String>,
 
@@ -50,6 +138,14 @@ pub struct Config {
     /// signature images do not count)
     #[arg(long = "has-attachment", default_value_t = false)]
     pub has_attachment: bool,
+
+    /// Only match messages with an attachment whose filename contains PATTERN;
+    /// repeatable (any of them matches)
+    // The question this answers has no other expression: neither the query nor
+    // Apple Mail's own search looks at attachment filenames, so "the zip the
+    // committee office sent" was previously unfindable except by memory.
+    #[arg(long = "attachment-name", value_name = "PATTERN")]
+    pub attachment_name: Vec<String>,
 
     /// Path to Mail directory
     #[arg(short = 'r', long = "mail-root", default_value = DEFAULT_MAIL_ROOT)]
@@ -80,6 +176,15 @@ pub struct Config {
         value_parser = clap::value_parser!(u32).range(0..=MAX_DAYS)
     )]
     pub days: Option<u32>,
+
+    /// Ignore Apple Mail's Envelope Index and read every message file
+    // An escape hatch, not a mode: the index only decides which files are worth
+    // opening, and every file it keeps is still parsed and matched normally, so
+    // both settings return the same messages. Worth having anyway - if a search
+    // ever does disagree, re-running it with this flag says in one step whether
+    // the index was involved.
+    #[arg(long = "no-index", default_value_t = false)]
+    pub no_index: bool,
 
     /// Output results as JSON to stdout instead of the interactive TUI
     #[arg(long = "json", default_value_t = false)]
@@ -134,6 +239,15 @@ impl Config {
                 .filter(|pattern| !pattern.is_empty())
                 .collect(),
             require_attachment: self.has_attachment,
+            attachment_names: self
+                .attachment_name
+                .iter()
+                .map(|pattern| pattern.trim().to_lowercase())
+                .filter(|pattern| !pattern.is_empty())
+                .collect(),
+            // Only the `dump` / `attachments` lookup sets this; a search has no
+            // flag for it.
+            message_id: None,
         }
     }
 
@@ -170,6 +284,9 @@ impl Config {
         if self.has_attachment {
             line.push_str(" +attachment");
         }
+        if !self.attachment_name.is_empty() {
+            line.push_str(&format!(" +file:{}", self.attachment_name.join(",")));
+        }
         line
     }
 }
@@ -179,7 +296,12 @@ mod tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Config {
-        Config::try_parse_from(std::iter::once("mailsearch").chain(args.iter().copied())).unwrap()
+        try_parse(args).unwrap()
+    }
+
+    fn try_parse(args: &[&str]) -> Result<Config, clap::Error> {
+        Cli::try_parse_from(std::iter::once("mailsearch").chain(args.iter().copied()))
+            .map(|cli| cli.search)
     }
 
     #[test]
@@ -202,12 +324,12 @@ mod tests {
 
     #[test]
     fn an_empty_query_is_rejected() {
-        assert!(Config::try_parse_from(["mailsearch"]).is_err());
+        assert!(try_parse(&[]).is_err());
     }
 
     #[test]
     fn json_and_tsv_conflict() {
-        assert!(Config::try_parse_from(["mailsearch", "q", "--json", "--tsv"]).is_err());
+        assert!(try_parse(&["q", "--json", "--tsv"]).is_err());
     }
 
     #[test]
@@ -311,12 +433,12 @@ mod tests {
     #[test]
     fn this_week_and_days_conflict() {
         assert!(
-            Config::try_parse_from(["mailsearch", "query", "--this-week", "--days", "3"]).is_err()
+            try_parse(&["query", "--this-week", "--days", "3"]).is_err()
         );
     }
 
     #[test]
     fn days_beyond_the_cap_is_rejected() {
-        assert!(Config::try_parse_from(["mailsearch", "query", "--days", "36501"]).is_err());
+        assert!(try_parse(&["query", "--days", "36501"]).is_err());
     }
 }
