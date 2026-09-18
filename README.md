@@ -130,9 +130,9 @@ extraction, which flattens whitespace because it only has to match a query.
 `attachments` lists them by default, or writes them out with `--save DIR`.
 `--json` prints the same information for another tool to act on: each entry
 carries the message's `path` and `message_id`, and each attachment its `name`,
-`mimetype`, `size`, `inline`, `downloaded`, and `saved_to` where one was written.
-That is what lets a wrapper pick up the parts reported as `"downloaded": false`
-and go and fetch them.
+`mimetype`, `size`, `inline`, `downloaded`, `source`, and `saved_to` where one
+was written. That is what lets a wrapper pick up the parts reported as
+`"source": "server"` and go and fetch them.
 Existing files are never overwritten (`report.pdf`, `report_2.pdf`, …), and a
 sender-supplied name cannot choose where the file lands. Embedded parts
 (signature images) are skipped unless `--include-inline` is given.
@@ -143,17 +143,65 @@ that lookup scans, and a window is the difference between reading a few thousand
 files and a quarter of a million.
 
 **Neither ever asks Apple Mail for anything.** That keeps them fast and keeps
-Mail's interface responsive, but it also means content Mail has not downloaded
-is not there to read. Such attachments are listed with their real name and size
-and marked `NOT DOWNLOADED` rather than reported as empty:
+Mail's interface responsive. It does not mean they only see what is inside the
+`.emlx`: attachments Mail fetched later are read from the
+[sidecar directory](#where-attachment-bytes-live) beside it. Only content that
+is genuinely still on the server cannot be read, and that is listed with its
+real name and declared size and marked `NOT DOWNLOADED` rather than reported as
+empty:
 
 ```
 ● 964173.partial.emlx
   外部260417 鈴木一郎.zip  (application/x-zip-compressed, 3,265,430 bytes, NOT DOWNLOADED)
 ```
 
-Fetching them is Apple Mail's job, and driving Mail is deliberately left to a
+Fetching those is Apple Mail's job, and driving Mail is deliberately left to a
 separate tool.
+
+### Where attachment bytes live
+
+Apple Mail stores a message in one of two shapes, and the difference is not
+visible from the message alone:
+
+```text
+…/INBOX.mbox/<UUID>/Data/2/7/9/Messages/123456.partial.emlx
+…/INBOX.mbox/<UUID>/Data/2/7/9/Attachments/123456/2/会議資料.docx
+…/INBOX.mbox/<UUID>/Data/2/7/9/Attachments/123456/3/発表スライド.pptx
+```
+
+A message received whole carries its parts inside the `.emlx`. When only the
+headers came down — which is what "Download attachments: Recent only" arranges —
+the file is named `*.partial.emlx` and each missing part carries an
+`X-Apple-Content-Length` header instead of its content.
+
+**Fetching an attachment afterwards does not change that file.** Mail writes the
+bytes to `Attachments/<rowid>/<part>/<filename>`, a sibling of `Messages`, and
+leaves the `.emlx` alone: the `.partial` name stays, the
+`X-Apple-Content-Length` headers stay. Judging by either therefore reports files
+that are sitting on disk as missing — and that is the common case, not a corner
+one: across one real mail store, 6,401 of the 11,265 messages with a sidecar
+directory were still named `*.partial.emlx`.
+
+So a part with no payload in the `.emlx` is looked for in the sidecar, and
+`source` reports which of the three it turned out to be:
+
+| `source` | meaning |
+| --- | --- |
+| `emlx` | payload is inside the `.emlx` |
+| `sidecar` | payload is a file under `Attachments/<rowid>/` |
+| `server` | not on disk at all; only Apple Mail can fetch it |
+
+`downloaded` stays the plain "can the bytes be read without Apple Mail" answer,
+so it is true for `emlx` and `sidecar` alike.
+
+Matching is by filename rather than by part number, since the sidecar's `<part>`
+directories follow Mail's own numbering of MIME parts and reimplementing that is
+a liability; part numbers only order the candidates, so two parts sharing a
+filename are taken in the order the message lists them. Names are compared after
+normalising to NFC — the filesystem stores Japanese decomposed while the header
+carries it composed — and after unifying `:` with `/`, which is how macOS writes
+a slash inside a filename. The size reported for a sidecar attachment is the
+file's own, which is more accurate than either declared size.
 
 ### Attachment filenames
 
@@ -420,7 +468,8 @@ cargo build --release
 - `clap` - CLI argument parsing
 - `mailparse` - `.emlx` / MIME parsing
 - `chrono` - date parsing, formatting, and the `--this-week` / `--days` windows
-- `walkdir` - recursive mail directory traversal
+- `walkdir` - recursive mail directory traversal, and scanning attachment sidecar directories
+- `unicode-normalization` - NFC/NFD normalising, so a header filename matches the filesystem's spelling of it
 - `rusqlite` - reads Apple Mail's Envelope Index (bundled SQLite; opened read-only)
 - `ratatui` + `crossterm` - interactive terminal UI
 - `rayon` - parallel search

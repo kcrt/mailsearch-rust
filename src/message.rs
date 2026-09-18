@@ -19,31 +19,66 @@ use anyhow::{Context, Result};
 use mailparse::{MailHeaderMap, ParsedMail};
 use std::path::{Path, PathBuf};
 
-/// Header that Apple Mail puts on a part whose content is still on the server.
+/// Header that Apple Mail puts on a part it had not fetched when the message
+/// was written.
 ///
-/// This is the reliable marker for "not downloaded yet". Judging by an empty
-/// payload instead would also flag a genuinely empty attachment, and judging by
-/// the `.partial.emlx` filename says nothing about *which* part is missing —
-/// a message can have one attachment on disk and another still on the server.
+/// It says the bytes were not in the `.emlx`, which is not the same as their not
+/// being on disk: Apple Mail never rewrites the file, so this header — and the
+/// `.partial.emlx` name — stay exactly as they were even after the attachment
+/// has been downloaded into the sidecar directory. See [`AttachmentSource`].
+/// Judging by an empty payload instead would flag a genuinely empty attachment,
+/// and the filename alone says nothing about *which* part is missing.
 const APPLE_CONTENT_LENGTH: &str = "X-Apple-Content-Length";
+
+/// Directory holding the attachments Apple Mail fetched after the fact,
+/// as a sibling of the `Messages` directory the `.emlx` lives in.
+const SIDECAR_DIR: &str = "Attachments";
+
+/// The directory `.emlx` files live in, whose sibling [`SIDECAR_DIR`] is.
+const MESSAGES_DIR: &str = "Messages";
 
 /// Headers shown when a message is displayed, in this order.
 const DISPLAY_HEADERS: [&str; 6] = ["Date", "From", "To", "Cc", "Subject", "Message-ID"];
 
-/// One attachment, as described by the message structure alone.
+/// Where an attachment's bytes are, if they are anywhere local.
+///
+/// Apple Mail has two places to put them and the message itself only ever
+/// describes the first. A mail small enough to arrive whole carries its parts
+/// inside the `.emlx`. A mail whose attachments were fetched afterwards — by
+/// opening it, by Quick Look, by "Download attachment" — gets them written to a
+/// sidecar directory beside it, and the `.emlx` is left untouched: the
+/// `.partial.emlx` name and the `X-Apple-Content-Length` headers both remain.
+/// Reading only the message therefore reports files that are sitting on disk as
+/// missing, which is what this distinguishes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AttachmentSource {
+    /// The payload is inside the `.emlx`.
+    Emlx,
+    /// The payload is a file under `Attachments/<rowid>/<part>/`.
+    Sidecar,
+    /// Not on disk at all; only Apple Mail can fetch it.
+    Server,
+}
+
+/// One attachment, as described by the message structure and the files beside it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct Attachment {
     pub name: String,
     pub mimetype: String,
-    /// Size in bytes: the decoded payload when it is on disk, otherwise the
-    /// size the sender or Apple Mail declared. `None` when neither is known.
+    /// Size in bytes: the payload's real length when it is on disk — decoded
+    /// from the `.emlx` or measured on the sidecar file — otherwise the size the
+    /// sender or Apple Mail declared. `None` when neither is known.
     pub size: Option<usize>,
     /// An embedded part — a signature logo, an image the HTML body references —
     /// rather than a file the sender attached.
     pub inline: bool,
-    /// Whether the content is on disk. `false` means Apple Mail still has it on
-    /// the server; the name and size are known but the bytes are not.
+    /// Whether the bytes can be read without Apple Mail, which is what every
+    /// caller actually wants to know. True for both [`AttachmentSource::Emlx`]
+    /// and [`AttachmentSource::Sidecar`].
     pub downloaded: bool,
+    /// Which of the two on-disk locations holds the bytes, or that neither does.
+    pub source: AttachmentSource,
 }
 
 /// A single message read from an `.emlx` file.
@@ -105,6 +140,7 @@ impl Message {
     pub fn attachments(&self) -> Vec<Attachment> {
         let mut out = Vec::new();
         collect_attachments(&self.parsed(), false, &mut out);
+        resolve_sidecar(&self.path, &mut out, false);
         out.into_iter().map(|(attachment, _)| attachment).collect()
     }
 
@@ -115,6 +151,7 @@ impl Message {
     pub fn attachment_payloads(&self) -> Vec<(Attachment, Option<Vec<u8>>)> {
         let mut out = Vec::new();
         collect_attachments(&self.parsed(), true, &mut out);
+        resolve_sidecar(&self.path, &mut out, true);
         out
     }
 
@@ -198,9 +235,11 @@ fn collect_attachments(
         .or_else(|| part.ctype.params.get("name"));
     let Some(name) = name else { return };
 
-    // Apple only writes this header on a part it has not fetched, so its
-    // presence is the answer; its value is the encoded length, which is why the
-    // declared `size` parameter is preferred for display.
+    // Apple only writes this header on a part that was not in the message when
+    // it was saved, so its presence rules the payload out of the `.emlx`; the
+    // sidecar is checked afterwards, in `resolve_sidecar`. Its value is the
+    // encoded length, which is why the declared `size` parameter is preferred
+    // for display.
     let pending = part.headers.get_first_value(APPLE_CONTENT_LENGTH);
     let downloaded = pending.is_none();
     let declared = disposition
@@ -228,9 +267,161 @@ fn collect_attachments(
             size,
             inline: is_inline(part),
             downloaded,
+            source: if downloaded {
+                AttachmentSource::Emlx
+            } else {
+                AttachmentSource::Server
+            },
         },
         payload,
     ));
+}
+
+/// Fill in attachments the `.emlx` does not carry from the sidecar beside it.
+///
+/// Matching is by filename, not by part number. The sidecar's `<part>`
+/// directories follow Apple Mail's own numbering of MIME parts, and tying to it
+/// would mean reimplementing that numbering — and being wrong about it for
+/// nested messages — for no gain. Part numbers are still used, but only to order
+/// the candidates, so that two parts sharing one filename are taken in the order
+/// the message lists them.
+///
+/// Costs nothing for a message that has everything inside it: without a part on
+/// the server there is no directory to read.
+fn resolve_sidecar(
+    message_path: &Path,
+    entries: &mut [(Attachment, Option<Vec<u8>>)],
+    with_payload: bool,
+) {
+    if !entries
+        .iter()
+        .any(|(attachment, _)| attachment.source == AttachmentSource::Server)
+    {
+        return;
+    }
+    let Some(directory) = sidecar_dir(message_path) else {
+        return;
+    };
+    let mut files = sidecar_files(&directory);
+    if files.is_empty() {
+        return;
+    }
+    for (attachment, payload) in entries {
+        if attachment.source != AttachmentSource::Server {
+            continue;
+        }
+        let key = name_key(&attachment.name);
+        let Some(index) = files.iter().position(|file| file.key == key) else {
+            continue;
+        };
+        // Taken out of the pool so a second part of the same name matches the
+        // next file rather than the same one again.
+        let file = files.remove(index);
+        // The file on disk is the only real length: both the declared `size` and
+        // `X-Apple-Content-Length` are the sender's word for it, and the latter
+        // counts the encoded form.
+        let measured = if with_payload {
+            std::fs::read(&file.path)
+                .ok()
+                .map(|bytes| (bytes.len(), Some(bytes)))
+        } else {
+            std::fs::metadata(&file.path)
+                .ok()
+                .map(|metadata| (metadata.len() as usize, None))
+        };
+        let Some((size, bytes)) = measured else {
+            continue;
+        };
+        attachment.size = Some(size);
+        attachment.downloaded = true;
+        attachment.source = AttachmentSource::Sidecar;
+        *payload = bytes;
+    }
+}
+
+/// The sidecar directory for a message, derived from its path.
+///
+/// ```text
+/// …/Data/2/7/9/Messages/123456.partial.emlx
+/// …/Data/2/7/9/Attachments/123456/
+/// ```
+///
+/// `None` for a path not shaped like a message inside a Mail store — a file a
+/// user pointed at directly, or a fixture written to a temporary directory.
+fn sidecar_dir(message_path: &Path) -> Option<PathBuf> {
+    let messages = message_path.parent()?;
+    if messages.file_name()? != MESSAGES_DIR {
+        return None;
+    }
+    // The rowid comes from `crate::index`, which already knows to strip
+    // `.partial` — the very suffix that survives the download.
+    let rowid = crate::index::rowid_from_path(message_path)?;
+    Some(
+        messages
+            .parent()?
+            .join(SIDECAR_DIR)
+            .join(rowid.to_string()),
+    )
+}
+
+/// One file found under a sidecar directory.
+struct SidecarFile {
+    /// The name as [`name_key`] compares it.
+    key: String,
+    /// The `<part>` component under the sidecar directory, where it is numeric.
+    /// Used for ordering only; see [`resolve_sidecar`].
+    part: Option<u32>,
+    path: PathBuf,
+}
+
+/// Every file under the sidecar directory, in part-number order.
+fn sidecar_files(directory: &Path) -> Vec<SidecarFile> {
+    let mut files: Vec<SidecarFile> = walkdir::WalkDir::new(directory)
+        .into_iter()
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_str()?;
+            // `.DS_Store` and friends are not anyone's attachment.
+            if name.starts_with('.') {
+                return None;
+            }
+            Some(SidecarFile {
+                key: name_key(name),
+                part: part_number(entry.path(), directory),
+                path: entry.path().to_path_buf(),
+            })
+        })
+        .collect();
+    files.sort_by(|a, b| a.part.cmp(&b.part).then_with(|| a.path.cmp(&b.path)));
+    files
+}
+
+/// The `<part>` directory a sidecar file sits in, as a number.
+fn part_number(path: &Path, directory: &Path) -> Option<u32> {
+    path.strip_prefix(directory)
+        .ok()?
+        .components()
+        .next()?
+        .as_os_str()
+        .to_str()?
+        .parse()
+        .ok()
+}
+
+/// A filename reduced to a form two spellings of the same name share.
+///
+/// Two differences show up between the name in the header and the name on disk,
+/// and neither is a difference in the name:
+///
+/// - the filesystem stores Japanese decomposed (NFD), while a header carries it
+///   composed (NFC), so `ポ` is one character in one and two in the other;
+/// - macOS writes `/` in a filename as `:`, since `/` is the path separator.
+fn name_key(name: &str) -> String {
+    use unicode_normalization::UnicodeNormalization;
+    name.nfc()
+        .map(|ch| if ch == ':' { '/' } else { ch })
+        .collect()
 }
 
 /// Whether a named part is embedded in the message rather than attached to it.
@@ -524,7 +715,167 @@ mod tests {
         let attachments = message.attachments();
         assert_eq!(attachments.len(), 1);
         assert!(!attachments[0].downloaded);
+        assert_eq!(attachments[0].source, AttachmentSource::Server);
         assert_eq!(attachments[0].size, Some(3_265_430));
+    }
+
+    /// A message stored the way Apple Mail stores one whose attachments were
+    /// fetched after the fact: still `.partial.emlx`, still carrying
+    /// `X-Apple-Content-Length`, with the bytes in a sidecar directory.
+    ///
+    /// ```text
+    /// <root>/Messages/123456.partial.emlx
+    /// <root>/Attachments/123456/<part>/<name>
+    /// ```
+    fn load_with_sidecar(
+        message: &str,
+        sidecar: &[(&str, &str, &[u8])],
+    ) -> (tempfile::TempDir, Message) {
+        let dir = tempfile::tempdir().unwrap();
+        let messages = dir.path().join("Messages");
+        std::fs::create_dir(&messages).unwrap();
+        let path = write_emlx(&messages, "123456.partial.emlx", message);
+        for (part, name, bytes) in sidecar {
+            let part_dir = dir.path().join("Attachments").join("123456").join(part);
+            std::fs::create_dir_all(&part_dir).unwrap();
+            std::fs::write(part_dir.join(name), bytes).unwrap();
+        }
+        let loaded = Message::load(&path).unwrap();
+        (dir, loaded)
+    }
+
+    /// The `.partial.emlx` + sidecar shape, which is the common case: measured on
+    /// one real INBOX, 378 of the 442 messages holding sidecar attachments were
+    /// still named `.partial.emlx`.
+    #[test]
+    fn an_attachment_in_the_sidecar_counts_as_downloaded() {
+        let (_dir, message) = load_with_sidecar(
+            concat!(
+                "Content-Type: multipart/mixed; boundary=b\n\n",
+                "--b\nContent-Type: text/plain\n\nbody\n",
+                "--b\nContent-Type: application/zip; name=\"big.zip\"\n",
+                "Content-Disposition: attachment; size=\"3265430\"; filename=\"big.zip\"\n",
+                "X-Apple-Content-Length: 4411197\n\n",
+                "--b--\n"
+            ),
+            &[("2", "big.zip", b"the real bytes")],
+        );
+        let attachments = message.attachments();
+        assert_eq!(attachments.len(), 1);
+        assert!(attachments[0].downloaded);
+        assert_eq!(attachments[0].source, AttachmentSource::Sidecar);
+        // The file on disk, not the size either the sender or Mail declared.
+        assert_eq!(attachments[0].size, Some("the real bytes".len()));
+    }
+
+    #[test]
+    fn a_sidecar_attachment_hands_back_its_bytes() {
+        let (_dir, message) = load_with_sidecar(
+            concat!(
+                "Content-Type: multipart/mixed; boundary=b\n\n",
+                "--b\nContent-Type: application/zip; name=\"big.zip\"\n",
+                "Content-Disposition: attachment; filename=\"big.zip\"\n",
+                "X-Apple-Content-Length: 4411197\n\n",
+                "--b--\n"
+            ),
+            &[("2", "big.zip", b"the real bytes")],
+        );
+        let payloads = message.attachment_payloads();
+        assert_eq!(payloads.len(), 1);
+        assert_eq!(payloads[0].1.as_deref(), Some(&b"the real bytes"[..]));
+    }
+
+    #[test]
+    fn a_japanese_name_matches_across_nfc_and_nfd() {
+        // The header carries NFC; the filesystem stores NFD. Comparing the two
+        // byte for byte finds nothing, and every Japanese attachment with a
+        // dakuten in its name would be reported as still on the server.
+        use unicode_normalization::UnicodeNormalization;
+        let composed = "アレルギーポータル_コラム②.docx";
+        let decomposed: String = composed.nfd().collect();
+        assert_ne!(composed, decomposed.as_str(), "fixture is not testing anything");
+
+        let (_dir, message) = load_with_sidecar(
+            &format!(
+                concat!(
+                    "Content-Type: multipart/mixed; boundary=b\n\n",
+                    "--b\nContent-Type: application/octet-stream\n",
+                    "Content-Disposition: attachment; filename=\"{composed}\"\n",
+                    "X-Apple-Content-Length: 4411197\n\n",
+                    "--b--\n"
+                ),
+                composed = composed
+            ),
+            &[("2", &decomposed, b"docx")],
+        );
+        let attachments = message.attachments();
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].source, AttachmentSource::Sidecar);
+        // The name is reported as the message spells it, not as the disk does.
+        assert_eq!(attachments[0].name, composed);
+    }
+
+    #[test]
+    fn a_part_with_no_sidecar_file_stays_on_the_server() {
+        // One attachment fetched and one not is an ordinary state, so the
+        // sidecar must not be taken as an answer for the whole message.
+        let (_dir, message) = load_with_sidecar(
+            concat!(
+                "Content-Type: multipart/mixed; boundary=b\n\n",
+                "--b\nContent-Type: application/zip\n",
+                "Content-Disposition: attachment; filename=\"here.zip\"\n",
+                "X-Apple-Content-Length: 10\n\n",
+                "--b\nContent-Type: application/zip\n",
+                "Content-Disposition: attachment; size=\"999\"; filename=\"absent.zip\"\n",
+                "X-Apple-Content-Length: 20\n\n",
+                "--b--\n"
+            ),
+            &[("2", "here.zip", b"bytes")],
+        );
+        let attachments = message.attachments();
+        assert_eq!(attachments.len(), 2);
+        assert_eq!(attachments[0].source, AttachmentSource::Sidecar);
+        assert_eq!(attachments[1].source, AttachmentSource::Server);
+        assert_eq!(attachments[1].size, Some(999));
+    }
+
+    #[test]
+    fn two_parts_sharing_a_name_take_different_files() {
+        // Mail numbers the sidecar directories by part, so the lower-numbered
+        // one belongs to the part the message lists first.
+        let (_dir, message) = load_with_sidecar(
+            concat!(
+                "Content-Type: multipart/mixed; boundary=b\n\n",
+                "--b\nContent-Type: image/png\n",
+                "Content-Disposition: attachment; filename=\"image001.png\"\n",
+                "X-Apple-Content-Length: 10\n\n",
+                "--b\nContent-Type: image/png\n",
+                "Content-Disposition: attachment; filename=\"image001.png\"\n",
+                "X-Apple-Content-Length: 20\n\n",
+                "--b--\n"
+            ),
+            &[("2", "image001.png", b"first"), ("10", "image001.png", b"second longer")],
+        );
+        let payloads = message.attachment_payloads();
+        assert_eq!(payloads.len(), 2);
+        assert_eq!(payloads[0].1.as_deref(), Some(&b"first"[..]));
+        assert_eq!(payloads[1].1.as_deref(), Some(&b"second longer"[..]));
+    }
+
+    #[test]
+    fn a_message_outside_a_mail_store_has_no_sidecar() {
+        // `Message::load` is given arbitrary paths; deriving a sidecar from one
+        // that is not shaped like a Mail store must simply find nothing.
+        assert_eq!(sidecar_dir(Path::new("/tmp/m.emlx")), None);
+        assert_eq!(sidecar_dir(Path::new("/a/Messages/draft.emlx")), None);
+        assert_eq!(
+            sidecar_dir(Path::new("/a/Data/2/7/9/Messages/123456.partial.emlx")),
+            Some(PathBuf::from("/a/Data/2/7/9/Attachments/123456"))
+        );
+        assert_eq!(
+            sidecar_dir(Path::new("/a/Data/2/7/9/Messages/123456.emlx")),
+            Some(PathBuf::from("/a/Data/2/7/9/Attachments/123456"))
+        );
     }
 
     #[test]

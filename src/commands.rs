@@ -17,7 +17,7 @@
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
 
-use crate::message::{strip_quote, Attachment, Message};
+use crate::message::{strip_quote, Attachment, AttachmentSource, Message};
 use crate::models::{normalise_message_id, Filters};
 use crate::search::search_messages;
 
@@ -72,10 +72,14 @@ fn attachment_line(attachment: &Attachment) -> String {
     if attachment.inline {
         notes.push("inline".to_string());
     }
-    if !attachment.downloaded {
+    match attachment.source {
+        // Worth naming: the `.emlx` still describes this part as missing, so
+        // anyone who looks at the file will otherwise think the tool is wrong.
+        AttachmentSource::Sidecar => notes.push("sidecar".to_string()),
         // Said plainly, because the previous tooling reported these as "0 bytes"
         // and an empty attachment reads as a real one.
-        notes.push("NOT DOWNLOADED".to_string());
+        AttachmentSource::Server => notes.push("NOT DOWNLOADED".to_string()),
+        AttachmentSource::Emlx => {}
     }
     format!("  {}  ({})", attachment.name, notes.join(", "))
 }
@@ -133,7 +137,9 @@ pub fn dump(path: &Path, headers_only: bool, strip_quotes: bool, prefer_html: bo
 ///
 /// Carries what a follow-up tool needs to act: which file each attachment came
 /// from, where it was written, and — the point of the whole thing — which are
-/// still on the server and therefore need Apple Mail.
+/// still on the server and therefore need Apple Mail. `source` says which of
+/// those it is; `downloaded` stays as the plain "are the bytes readable"
+/// answer, true for a sidecar file as much as for one inside the `.emlx`.
 #[derive(serde::Serialize)]
 pub struct AttachmentReport {
     pub path: String,
@@ -213,9 +219,12 @@ pub fn print_attachment_report(report: &AttachmentReport, saving: bool) {
             .to_string_lossy()
     );
     let mut pending = 0;
+    let mut sidecar = 0;
     for reported in &report.attachments {
-        if !reported.attachment.downloaded {
-            pending += 1;
+        match reported.attachment.source {
+            AttachmentSource::Server => pending += 1,
+            AttachmentSource::Sidecar => sidecar += 1,
+            AttachmentSource::Emlx => {}
         }
         match &reported.saved_to {
             Some(target) => println!(
@@ -232,6 +241,12 @@ pub fn print_attachment_report(report: &AttachmentReport, saving: bool) {
         eprintln!(
             "  {pending} attachment(s) are still on the server. \
              Apple Mail has to fetch those; this tool does not drive it."
+        );
+    }
+    if sidecar > 0 {
+        eprintln!(
+            "  {sidecar} attachment(s) came from the sidecar directory \
+             (the .emlx still calls them undownloaded)."
         );
     }
     if report.attachments.is_empty() {
@@ -390,10 +405,30 @@ mod tests {
             size: Some(3_265_430),
             inline: false,
             downloaded: false,
+            source: AttachmentSource::Server,
         };
         let line = attachment_line(&attachment);
         assert!(line.contains("3,265,430 bytes"), "{line}");
         assert!(line.contains("NOT DOWNLOADED"), "{line}");
+    }
+
+    #[test]
+    fn a_sidecar_attachment_is_not_called_undownloaded() {
+        // The `.emlx` still says otherwise, so the line names where it came from
+        // rather than staying silent.
+        let attachment = Attachment {
+            name: "会議資料.docx".to_string(),
+            mimetype: "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                .to_string(),
+            size: Some(22_702),
+            inline: false,
+            downloaded: true,
+            source: AttachmentSource::Sidecar,
+        };
+        let line = attachment_line(&attachment);
+        assert!(!line.contains("NOT DOWNLOADED"), "{line}");
+        assert!(line.contains("sidecar"), "{line}");
+        assert!(line.contains("22,702 bytes"), "{line}");
     }
 
     #[test]
@@ -404,6 +439,7 @@ mod tests {
             size: Some(1_234),
             inline: false,
             downloaded: true,
+            source: AttachmentSource::Emlx,
         };
         assert_eq!(
             attachment_line(&attachment),
